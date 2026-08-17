@@ -1,0 +1,37 @@
+
+/* ── BUDGET LAB v2 ── */
+.budget-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .budget-split { grid-template-columns: 1fr; }
+}
+
+.preset-chip {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  padding: 0.3rem 0.75rem; border-radius: 20px; font-size: 0.78rem;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text-muted); cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.preset-chip:hover {
+  background: rgba(201,168,76,0.12); border-color: var(--accent-gold);
+  color: var(--accent-gold);
+}
+.preset-chip.active {
+  background: rgba(201,168,76,0.18); border-color: var(--accent-gold);
+  color: var(--accent-gold); font-weight: 600;
+}
+
+.alloc-input {
+  width: 90px; background: var(--card-bg);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 0.22rem 0.4rem; font-size: 0.8rem; color: var(--text);
+  transition: border-color 0.15s;
+}
+.alloc-input:focus { outline: none; border-color: var(--accent-gold); }
+.alloc-input:disabled { opacity: 0.45; cursor: not-allowed; }

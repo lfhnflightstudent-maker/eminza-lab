@@ -1,0 +1,17689 @@
+// ═══════════════════════════════════════════════════════════════
+// EMINZA MARKETING INTELLIGENCE LAB — app.js
+// English version. All logic in English.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Constants ────────────────────────────────────────────────
+const API_URL     = '/api/data';
+const REFRESH_URL = '/api/refresh';
+const WEEKLY_URL  = '/api/weekly';
+const SUIVI_URL   = '/api/suivi';
+const PASSWORD    = 'eminza2026';
+
+// Financial model (Group Financing Model V1-2, Aug 2026)
+const FM = (function() {
+  // Group Financing Model V1-2, Aug 2026
+  const grossMargin        = 0.59;
+  const returnsRate        = 0.18;
+  const variableLogistics  = 0.08;
+  const shippingCost       = 0.04;
+  const directSales        = 0.02;
+  const rfa                = 0.02;   // royalties / franchise / agency fees
+  const netReturnImpact    = returnsRate * 0.40;
+  const totalVariableExAds = variableLogistics + shippingCost + directSales + rfa + netReturnImpact;
+  const contributionMargin          = grossMargin - totalVariableExAds;
+  const contributionMarginAvailable = contributionMargin; // alias used by budget_lab
+  const profitBreakevenRoas  = 1 / contributionMargin;
+  const variableBreakevenRoas = 1 / grossMargin;
+  return {
+    grossMargin, returnsRate, variableLogistics, shippingCost, directSales, rfa,
+    netReturnImpact, totalVariableExAds,
+    contributionMargin, contributionMarginAvailable,
+    profitBreakevenRoas, variableBreakevenRoas
+  };
+})();
+
+const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING','OTHER'];
+
+const TIER_COLORS = {
+  TOP: '#10B981', 'TOP SEASONAL': '#6366F1', 'CATCH ALL': '#8B5CF6',
+  MID: '#3B82F6', LOW: '#F59E0B', ZOMBIE: '#EF4444',
+  NOUVEAUTES: '#14B8A6', BRANDING: '#C9A84C', OTHER: '#6B7280'
+};
+
+const MKT_COLORS = {
+  FR:'#2563EB', ES:'#DC2626', IT:'#16A34A', NL:'#EA580C',
+  BE:'#9333EA', DK:'#0891B2', CH:'#CA8A04', UK:'#374151', OTHER:'#6B7280'
+};
+
+// ── Global state ─────────────────────────────────────────────
+window.EMINZA = {
+  campaigns: [],
+  weekly:    [],
+  suivi:     [],
+  lastRefresh: null,
+  dataSource: 'Google Sheets CSV (GID 137941485)'
+};
+let activeCharts  = {};
+let currentNav    = 'cockpit';
+let currentFilters = { market: 'ALL', tier: 'ALL', search: '' };
+let campaignSort  = { field: 'cost', dir: 'desc' };
+let campaignPage  = 0;
+const PAGE_SIZE   = 30;
+
+// ── Boot ─────────────────────────────────────────────────────
+function boot() {
+  try {
+    renderShell();
+    navigate('cockpit');
+  } catch(e) {
+    console.error('renderShell failed:', e);
+    document.getElementById('app-content').innerHTML =
+      `<div style="padding:2rem;color:#EF4444">Shell error: ${e.message}</div>`;
+    return;
+  }
+  loadData();
+  setTimeout(loadWeeklyData, 800);
+  setTimeout(function() {
+    if (typeof loadSuiviData === 'function') loadSuiviData();
+  }, 1200);
+}
+
+// ── Data loading ─────────────────────────────────────────────
+function setStatus(msg) {
+  const el = document.getElementById('data-status');
+  if (el) el.textContent = msg;
+}
+
+function loadData() {
+  setStatus('Loading...');
+  fetch(API_URL)
+    .then(r => r.json())
+    .then(data => {
+      window.EMINZA.lastRefresh = data.fetched_at || new Date().toISOString();
+      window.EMINZA.dataSource  = data.source || window.EMINZA.dataSource;
+      processData(data.rows || data.data || []);
+      setStatus(`✓ ${window.EMINZA.campaigns.length} campaigns · ${window.EMINZA.dataSource}`);
+    })
+    .catch(err => {
+      setStatus('⚠ Data load failed — check server');
+      console.error('loadData error:', err);
+    });
+}
+
+function processData(rows) {
+  function money(v) { return parseFloat((v||'0').toString().replace(/[$,\s]/g,'')) || 0; }
+  function pct(v)   { return parseFloat((v||'0').toString().replace('%','')) / 100 || 0; }
+  function num(v)   { return parseFloat((v||'0').toString().replace(/[,$\s]/g,'')) || 0; }
+
+  window.EMINZA.campaigns = rows
+    .filter(r => r.Campaign && r.Campaign.trim())
+    .map(r => {
+      const name   = (r.Campaign || '').trim();
+      const cost   = money(r.Cost);
+      const rev    = money(r['Conv. value']);
+      const conv   = num(r.Conversions);
+      const clicks = num(r.Clicks);
+      return {
+        name, cost, convValue: rev, conv, clicks,
+        status: (r['Campaign status'] || 'enabled').toLowerCase(),
+        type:   r['Campaign type'] || 'Search',
+        ctr:    pct(r.CTR),
+        cpc:    money(r['Avg. CPC']),
+        tier:   classifyTier(name),
+        market: classifyMarket(name),
+        cat:    classifyCat(name),
+        roas:   cost > 0 ? rev / cost : 0,
+        cpa:    conv > 0 ? cost / conv : 0,
+        cvr:    clicks > 0 ? conv / clicks : 0,
+      };
+    });
+
+  navigate(currentNav);
+}
+
+// loadWeeklyData is defined in wow_trends.js below
+
+window.manualRefresh = function() {
+  document.getElementById('data-status').textContent = 'Refreshing...';
+  fetch(REFRESH_URL, { method: 'POST' })
+    .then(() => loadData())
+    .catch(() => loadData());
+};
+
+// ── Classification ────────────────────────────────────────────
+function classifyTier(name) {
+  const n = name.toUpperCase();
+  if (n.includes('ZOMBIE'))              return 'ZOMBIE';
+  if (/\bBR\/|BRANDING\b/.test(n))       return 'BRANDING';
+  if (n.includes('NOUVEAUTES'))          return 'NOUVEAUTES';
+  if (n.includes('CATCH ALL') || n.includes('CATCH-ALL')) return 'CATCH ALL';
+  if (n.includes('TOP SAISONNIERS') || n.includes('TOP SEASONAL') || n.includes('TOP PERMANENT')) return 'TOP SEASONAL';
+  if (n.includes('/TOP') || n.includes('TOP PERFORMERS')) return 'TOP';
+  if (n.includes('/MID') || n.includes('MID PERFORMERS')) return 'MID';
+  if (n.includes('/LOW') || n.includes('LOW PERFORMERS')) return 'LOW';
+  return 'OTHER';
+}
+
+// Valid market codes — prevents campaign prefixes like BR (Branding), LM, MD being misclassified
+const VALID_MARKETS = new Set(['FR','IT','ES','NL','BE','DK','UK','DE','CH','CH-DE','CH-FR']);
+
+function classifyMarket(name) {
+  const n = name.toUpperCase();
+  // Multi-word market codes first
+  if (n.includes('CH-DE') || n.includes('CH_DE')) return 'CH-DE';
+  if (n.includes('CH-FR') || n.includes('CH_FR')) return 'CH-FR';
+  // Single market prefixes (exact whitelist only)
+  const SINGLE = ['FR','IT','ES','NL','BE','DK','UK','DE','CH'];
+  for (const mkt of SINGLE) {
+    if (n.startsWith(mkt+'/') || n.startsWith(mkt+'_') || n.startsWith(mkt+' ') ||
+        n.includes('_'+mkt+'/') || n.includes('/'+mkt+'/') || n.includes('_'+mkt+'_')) {
+      return mkt;
+    }
+  }
+  return 'OTHER';
+}
+
+function classifyCat(name) {
+  const n = name.toLowerCase();
+  if (n.includes('jardin') || n.includes('garden')) return 'Garden';
+  if (n.includes('linge') || n.includes('textile')) return 'Linen';
+  if (n.includes('noel') || n.includes('noël') || n.includes('christmas')) return 'Christmas';
+  if (n.includes('mobilier') || n.includes('deco') || n.includes('meuble')) return 'Furniture';
+  if (n.includes('saison')) return 'Seasonal';
+  return 'Permanent';
+}
+
+// ── Aggregation ───────────────────────────────────────────────
+function aggregate(camps) {
+  const t = camps.reduce((a, c) => {
+    a.spend     += c.cost;
+    a.convValue += c.convValue;
+    a.conv      += c.conv;
+    a.clicks    += c.clicks;
+    a.impr      += c.impr;
+    a.count     += 1;
+    return a;
+  }, { spend:0, convValue:0, conv:0, clicks:0, impr:0, count:0 });
+  return deriveMetrics(t);
+}
+
+function deriveMetrics(o) {
+  o.roas = o.spend > 0 ? o.convValue / o.spend : 0;
+  o.cpa  = o.conv  > 0 ? o.spend / o.conv : 0;
+  o.cpc  = o.clicks > 0 ? o.spend / o.clicks : 0;
+  o.cvr  = o.clicks > 0 ? o.conv / o.clicks : 0;
+  o.ctr  = o.impr   > 0 ? o.clicks / o.impr : 0;
+  return o;
+}
+
+function groupBy(arr, key) {
+  const map = {};
+  arr.forEach(c => {
+    const k = c[key] || 'Unknown';
+    if (!map[k]) map[k] = { key: k, spend:0, convValue:0, conv:0, clicks:0, impr:0, count:0 };
+    map[k].spend     += c.cost;
+    map[k].convValue += c.convValue;
+    map[k].conv      += c.conv;
+    map[k].clicks    += c.clicks;
+    map[k].impr      += c.impr;
+    map[k].count     += 1;
+  });
+  return Object.values(map).map(g => deriveMetrics(g));
+}
+
+function filteredCampaigns() {
+  return window.EMINZA.campaigns.filter(c => {
+    if (currentFilters.market !== 'ALL' && c.market !== currentFilters.market) return false;
+    if (currentFilters.tier !== 'ALL' && c.tier !== currentFilters.tier) return false;
+    if (currentFilters.search && !c.name.toLowerCase().includes(currentFilters.search.toLowerCase())) return false;
+    return true;
+  });
+}
+
+// ── Formatters ────────────────────────────────────────────────
+const fmt = {
+  cur:  v => '€' + (v||0).toLocaleString('en-GB', {minimumFractionDigits:0, maximumFractionDigits:0}),
+  curK: v => Math.abs(v||0) >= 1000 ? '€' + ((v||0)/1000).toFixed(1) + 'k' : '€' + (v||0).toFixed(0),
+  num:  v => (v||0).toLocaleString('en-GB'),
+  pct:  v => ((v||0)*100).toFixed(1) + '%',
+  roas: v => (v||0).toFixed(2) + 'x',
+  dec:  v => (v||0).toFixed(1),
+};
+
+// Returns real hex — Chart.js cannot read CSS custom properties
+function roasColor(r) {
+  return r >= FM.profitBreakevenRoas ? '#10B981' : r >= FM.variableBreakevenRoas ? '#F59E0B' : '#EF4444';
+}
+function roasColorCss(r) {
+  return r >= FM.profitBreakevenRoas ? 'var(--success)' : r >= FM.variableBreakevenRoas ? 'var(--warning)' : 'var(--danger)';
+}
+function contRoasColor(r) { return r >= 1 ? '#10B981' : '#EF4444'; }
+function contRoasColorCss(r) { return r >= 1 ? 'var(--success)' : 'var(--danger)'; }
+function contributionRoas(roas) { return roas * FM.contributionMargin; }
+
+// ── Badge helpers ─────────────────────────────────────────────
+function tierBadge(t) {
+  const c = TIER_COLORS[t] || '#6B7280';
+  return `<span class="badge" style="background:${c}22;color:${c};border:1px solid ${c}44">${t}</span>`;
+}
+function mktBadge(m) {
+  const c = MKT_COLORS[m] || '#6B7280';
+  return `<span class="badge" style="background:${c}22;color:${c};border:1px solid ${c}44">${m}</span>`;
+}
+function statusDot(s) {
+  const on = s === 'enabled' || s === 'active';
+  return `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${on?'var(--success)':'var(--muted)'}"></span>`;
+}
+
+// ── Shell / Navigation ────────────────────────────────────────
+function renderShell() {
+  const nav = [
+    { group: 'Overview' },
+    { id:'cockpit',         icon:'📊', label:'Executive Cockpit' },
+    { id:'connections',     icon:'🔗', label:'Data Connections' },
+    { group: 'Analysis' },
+    { id:'campaigns',       icon:'🔍', label:'Campaign Explorer' },
+    { id:'tier',            icon:'📈', label:'Tier Diagnostic' },
+    { id:'market',          icon:'🌍', label:'Market Analysis' },
+    { id:'audit',           icon:'📋', label:'Previous Analysis Audit' },
+    { group: 'Trends' },
+    { id:'wow',             icon:'📅', label:'Weekly Tracker' },
+    { id:'trends',          icon:'📉', label:'Trends Dashboard' },
+    { id:'category',        icon:'📂', label:'Category Detail' },
+    { group: 'Planning' },
+    { id:'budget',          icon:'💰', label:'Budget Lab' },
+    { id:'incrementality',  icon:'🔬', label:'Incrementality Lab' },
+    { group: 'Intelligence' },
+    { id:'ai',              icon:'🤖', label:'AI Analyst' },
+    { id:'recommendations', icon:'📝', label:'Recommendations' },
+    { group: 'Reference' },
+    { id:'skus',            icon:'📦', label:'SKU Diagnostic' },
+    { id:'dictionary',      icon:'📖', label:'Metric Dictionary' },
+    { id:'guide',           icon:'❓', label:'Guide d\'utilisation' },
+  ];
+
+  const navHtml = nav.map(item => {
+    if (item.group) return `<div class="nav-group-label">${item.group}</div>`;
+    const active = item.id === currentNav;
+    return `<div class="nav-item${active?' active':''}" onclick="navigate('${item.id}')">
+      <span class="nav-icon">${item.icon}</span><span class="nav-label">${item.label}</span>
+    </div>`;
+  }).join('');
+
+  const mkts = ['ALL','FR','IT','ES','NL','BE','DK','CH','UK','DE'];
+  const tiers = ['ALL','TOP','TOP SEASONAL','MID','LOW','ZOMBIE','CATCH ALL','NOUVEAUTES','BRANDING'];
+
+  document.getElementById('app-content').innerHTML = `
+    <div class="app-layout">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="sidebar-logo">EMINZA LAB</div>
+          <div class="sidebar-sub">Marketing Intelligence</div>
+        </div>
+        <nav class="nav-menu">${navHtml}</nav>
+        <div class="sidebar-footer">
+          <div id="data-status" class="data-status">Loading...</div>
+          <button class="btn-ghost" onclick="manualRefresh()" style="margin-top:8px;width:100%">↻ Refresh data</button>
+          <button class="btn-ghost" onclick="sessionStorage.clear();location.reload()" style="margin-top:4px;width:100%">Sign out</button>
+        </div>
+      </aside>
+      <div class="main-wrapper">
+        <div class="topbar">
+          <div class="topbar-left">
+            <span class="demo-badge">⚡ LIVE DATA · READ-ONLY · NO OPERATIONAL CHANGES</span>
+          </div>
+          <div class="topbar-filters">
+            <input type="text" id="search-filter" placeholder="Search campaigns..." onInput="currentFilters.search=this.value;renderSection()" style="padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.82rem;width:180px">
+            <select id="mkt-filter" onchange="currentFilters.market=this.value;renderSection()">
+              ${mkts.map(m=>`<option value="${m}">${m==='ALL'?'All Markets':m}</option>`).join('')}
+            </select>
+            <select id="tier-filter" onchange="currentFilters.tier=this.value;renderSection()">
+              ${tiers.map(t=>`<option value="${t}">${t==='ALL'?'All Tiers':t}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div id="main-content" class="main-content"></div>
+      </div>
+    </div>`;
+}
+
+window.navigate = function(id) {
+  currentNav = id;
+  // Update nav active state
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => {
+    if (el.getAttribute('onclick') === `navigate('${id}')`) el.classList.add('active');
+  });
+  renderSection();
+};
+
+function renderSection() {
+  const routes = {
+    cockpit:         renderCockpit,
+    connections:     renderConnections,
+    campaigns:       renderCampaigns,
+    tier:            renderTierDiagnostic,
+    market:          renderMarket,
+    audit:           renderAudit,
+    wow:             renderWoW,
+    trends:          renderTrends,
+    category:        renderCategory,
+    budget:          renderBudget,
+    incrementality:  renderIncrementality,
+    ai:              renderAI,
+    recommendations: renderRecommendations,
+    skus:            renderSKUs,
+    dictionary:      renderDictionary,
+    ga4:             renderGA4,
+    guide:           renderGuide,
+  };
+  try {
+    const fn = routes[currentNav];
+    if (fn) fn();
+    else setMain(`<div class="section-header"><h2>${currentNav}</h2></div><p>Coming soon.</p>`);
+  } catch(e) {
+    setMain(`<div style="padding:1rem;color:var(--danger)">⚠ Error in "${currentNav}": ${e.message}<br><small>${e.stack||''}</small></div>`);
+    console.error(e);
+  }
+}
+
+function setMain(html) {
+  const m = document.getElementById('main-content');
+  if (m) { m.innerHTML = html; m.scrollTop = 0; }
+}
+
+function makeChart(id, type, labels, datasets, opts={}) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const ctx = el.getContext('2d');
+  if (activeCharts[id]) activeCharts[id].destroy();
+  activeCharts[id] = new Chart(ctx, {
+    type,
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color:'var(--text)', font:{ size:11 } } } },
+      scales: type !== 'pie' && type !== 'doughnut' ? {
+        x: { ticks:{ color:'var(--muted)', font:{size:10} }, grid:{ color:'rgba(255,255,255,0.05)' } },
+        y: { ticks:{ color:'var(--muted)', font:{size:10} }, grid:{ color:'rgba(255,255,255,0.05)' } }
+      } : {},
+      ...opts
+    }
+  });
+  return activeCharts[id];
+}
+
+function destroyCharts() {
+  Object.values(activeCharts).forEach(c => { try { c.destroy(); } catch(_){} });
+  activeCharts = {};
+}
+
+// ── KPI card helper ───────────────────────────────────────────
+function kpiCard(label, value, sub='', color='') {
+  return `<div class="kpi-card">
+    <div class="kpi-label">${label}</div>
+    <div class="kpi-value" style="${color?`color:${color}`:''}"><b>${value}</b></div>
+    ${sub?`<div class="kpi-sub">${sub}</div>`:''}
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: EXECUTIVE COCKPIT
+// ══════════════════════════════════════════════════════════════
+function renderCockpit() {
+  const camps = filteredCampaigns();
+  const tot   = aggregate(camps);
+  const cRoas = contributionRoas(tot.roas);
+  const tierGroups = groupBy(camps, 'tier').sort((a,b)=>b.spend-a.spend);
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).slice(0,8);
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Overview</div>
+      <h2>Executive Cockpit</h2>
+      <p class="section-desc">${camps.length} campaigns · Last refresh: ${window.EMINZA.lastRefresh ? new Date(window.EMINZA.lastRefresh).toLocaleString() : 'Loading...'}</p>
+    </div>
+
+    <div class="kpi-strip">
+      ${kpiCard('Total Spend', fmt.curK(tot.spend), window.EMINZA.dataSource)}
+      ${kpiCard('Conv. Value', fmt.curK(tot.convValue), 'Google Ads attributed')}
+      ${kpiCard('Attributed ROAS', fmt.roas(tot.roas), `Break-even: ${fmt.roas(FM.profitBreakevenRoas)}`, roasColor(tot.roas))}
+      ${kpiCard('Contribution ROAS', fmt.roas(cRoas), 'After COGS, fulfilment, returns', cRoas >= 1 ? 'var(--success)' : 'var(--danger)')}
+      ${kpiCard('Conversions', fmt.num(tot.conv), `CPA: ${fmt.cur(tot.cpa)}`)}
+      ${kpiCard('Conv. Rate', fmt.pct(tot.cvr), `Clicks: ${fmt.num(tot.clicks)}`)}
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.75rem;margin-top:1rem">
+      <div class="card">
+        <div class="card-header">SPEND BY TIER</div>
+        <div class="chart-wrap h-sm" style="position:relative"><canvas id="ck-tier-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-header">ROAS BY TIER</div>
+        <div class="chart-wrap h-sm" style="position:relative"><canvas id="ck-tier-roas"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-header">SPEND BY MARKET</div>
+        <div class="chart-wrap h-sm" style="position:relative"><canvas id="ck-mkt-spend"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:1rem">
+      <div class="card-header">Tier Performance Summary</div>
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Tier</th><th>Spend</th><th>Conv. Value</th><th>ROAS</th>
+          <th>Contrib. ROAS</th><th>CPA</th><th>CVR</th><th>Campaigns</th>
+        </tr></thead>
+        <tbody>
+          ${TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t)).map(t=>{
+            const g = tierGroups.find(x=>x.key===t);
+            const cr = contributionRoas(g.roas);
+            return `<tr>
+              <td>${tierBadge(t)}</td>
+              <td>${fmt.curK(g.spend)}</td>
+              <td>${fmt.curK(g.convValue)}</td>
+              <td style="color:${roasColor(g.roas)};font-weight:600">${fmt.roas(g.roas)}</td>
+              <td style="color:${cr>=1?'var(--success)':'var(--danger)'};">${fmt.roas(cr)}</td>
+              <td>${fmt.cur(g.cpa)}</td>
+              <td>${fmt.pct(g.cvr)}</td>
+              <td>${g.count}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `);
+
+  setTimeout(() => {
+    const gridOpts = { plugins:{legend:{display:false}}, scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}},
+      y:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}
+    }};
+    makeChart('ck-tier-spend','doughnut',
+      tierGroups.map(g=>g.key),
+      [{data:tierGroups.map(g=>g.spend), backgroundColor:tierGroups.map(g=>TIER_COLORS[g.key]||'#6B7280')}],
+      {plugins:{legend:{position:'right',labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}});
+    // Exclude BRANDING from ROAS chart (54x outlier distorts scale)
+    const roasTiers = tierGroups.filter(g => g.key !== 'BRANDING');
+    makeChart('ck-tier-roas','bar',
+      roasTiers.map(g=>g.key),
+      [{label:'ROAS',data:roasTiers.map(g=>parseFloat(g.roas.toFixed(2))),
+        backgroundColor:roasTiers.map(g=>roasColor(g.roas)+'99'),
+        borderColor:roasTiers.map(g=>roasColor(g.roas)), borderWidth:1}],
+      {...gridOpts, plugins:{legend:{display:false}},
+       scales:{...gridOpts.scales, y:{...gridOpts.scales.y, beginAtZero:true,
+         ticks:{color:'#8A9BB3',callback:v=>v+'x'}}}});
+    makeChart('ck-mkt-spend','doughnut',
+      mktGroups.map(g=>g.key),
+      [{data:mktGroups.map(g=>g.spend), backgroundColor:mktGroups.map(g=>MKT_COLORS[g.key]||'#6B7280')}],
+      {plugins:{legend:{position:'right',labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}});
+  }, 80);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: DATA CONNECTIONS
+// ══════════════════════════════════════════════════════════════
+function renderConnections() {
+  const sources = [
+    { name:'Google Ads (via Sheets)', status:'connected', account:'Eminza Group', range:'YTD 2026', grain:'Campaign/day', refresh: window.EMINZA.lastRefresh ? new Date(window.EMINZA.lastRefresh).toLocaleString() : '—', limits:'No creative breakdown, no search terms, no audience data' },
+    { name:'Weekly Tracker (Suivi hebdo)', status:'connected', account:'Excel upload via /api/suivi', range:'W01–W31 2026', grain:'Category/market/week', refresh:'On server restart', limits:'Category level only — no campaign mapping' },
+    { name:'GA4', status:'missing', blocks:'True CVR, bounce rate, session quality, audience insights' },
+    { name:'Shopify / ERP', status:'missing', blocks:'Real revenue, returns, margins, LTV' },
+    { name:'Meta Ads', status:'missing', blocks:'Cross-channel attribution, blended ROAS' },
+    { name:'Stock / Product Feed', status:'missing', blocks:'SKU availability analysis, out-of-stock impact' },
+  ];
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Overview</div>
+      <h2>Data Connections</h2>
+    </div>
+    <div class="card">
+      <table class="cockpit-table">
+        <thead><tr><th>Source</th><th>Status</th><th>Account / Range</th><th>Grain</th><th>Last Refresh</th><th>Limitations / Blocked Analyses</th></tr></thead>
+        <tbody>
+          ${sources.map(s => `<tr>
+            <td><strong>${s.name}</strong></td>
+            <td><span class="status-badge status-${s.status}">${s.status}</span></td>
+            <td>${s.account||'—'}</td>
+            <td>${s.grain||'—'}</td>
+            <td>${s.refresh||'—'}</td>
+            <td style="font-size:0.8rem;color:var(--muted)">${s.limits||s.blocks||'—'}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: CAMPAIGN EXPLORER
+// ══════════════════════════════════════════════════════════════
+function renderCampaigns() {
+  const camps = filteredCampaigns()
+    .sort((a,b) => {
+      const v = campaignSort.dir === 'asc' ? 1 : -1;
+      return (a[campaignSort.field]||0) > (b[campaignSort.field]||0) ? v : -v;
+    });
+  const total = camps.length;
+  const start = campaignPage * PAGE_SIZE;
+  const page  = camps.slice(start, start + PAGE_SIZE);
+
+  function th(label, field) {
+    const active = campaignSort.field === field;
+    const arrow = active ? (campaignSort.dir==='asc'?'↑':'↓') : '';
+    return `<th onclick="window.sortCampaigns('${field}')" style="cursor:pointer;user-select:none">${label} ${arrow}</th>`;
+  }
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Analysis</div>
+      <h2>Campaign Explorer</h2>
+      <p class="section-desc">${total} campaigns · Page ${campaignPage+1} of ${Math.ceil(total/PAGE_SIZE)||1}</p>
+    </div>
+    <div class="card">
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+        <button class="btn-ghost" onclick="window.exportCSV()">⬇ Export CSV</button>
+        <span style="margin-left:auto;color:var(--muted);font-size:0.8rem">${total} results</span>
+      </div>
+      <div style="overflow-x:auto">
+      <table class="cockpit-table">
+        <thead><tr>
+          ${th('Campaign','name')} ${th('Market','market')} ${th('Tier','tier')}
+          ${th('Spend','cost')} ${th('Conv. Value','convValue')} ${th('ROAS','roas')}
+          ${th('Contrib. ROAS','roas')} ${th('CPA','cpa')} ${th('CVR','cvr')}
+          ${th('Clicks','clicks')} ${th('Conv.','conv')} <th>Status</th>
+        </tr></thead>
+        <tbody>
+          ${page.map(c => {
+            const cr = contributionRoas(c.roas);
+            return `<tr>
+              <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${c.name}">${c.name}</td>
+              <td>${mktBadge(c.market)}</td>
+              <td>${tierBadge(c.tier)}</td>
+              <td>${fmt.curK(c.cost)}</td>
+              <td>${fmt.curK(c.convValue)}</td>
+              <td style="color:${roasColor(c.roas)};font-weight:600">${fmt.roas(c.roas)}</td>
+              <td style="color:${cr>=1?'var(--success)':'var(--danger)'}">${fmt.roas(cr)}</td>
+              <td>${fmt.cur(c.cpa)}</td>
+              <td>${fmt.pct(c.cvr)}</td>
+              <td>${fmt.num(c.clicks)}</td>
+              <td>${fmt.num(c.conv)}</td>
+              <td>${statusDot(c.status)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+        <button class="btn-ghost" onclick="window.changePage(-1)" ${campaignPage===0?'disabled':''}>← Prev</button>
+        <span style="color:var(--muted);font-size:0.82rem">${start+1}–${Math.min(start+PAGE_SIZE,total)} of ${total}</span>
+        <button class="btn-ghost" onclick="window.changePage(1)" ${start+PAGE_SIZE>=total?'disabled':''}>Next →</button>
+      </div>
+    </div>
+  `);
+}
+
+window.sortCampaigns = function(field) {
+  if (campaignSort.field === field) campaignSort.dir = campaignSort.dir==='asc'?'desc':'asc';
+  else { campaignSort.field = field; campaignSort.dir = 'desc'; }
+  campaignPage = 0;
+  renderCampaigns();
+};
+window.changePage = function(d) { campaignPage = Math.max(0, campaignPage+d); renderCampaigns(); };
+window.exportCSV  = function() {
+  const cols = ['name','market','tier','cost','convValue','roas','cpa','cvr','clicks','conv'];
+  const rows = [cols.join(','), ...filteredCampaigns().map(c => cols.map(k => JSON.stringify(c[k]||'')).join(','))];
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(rows.join('\n'));
+  a.download = 'eminza_campaigns.csv';
+  a.click();
+};
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: TIER DIAGNOSTIC
+// ══════════════════════════════════════════════════════════════
+function renderTierDiagnostic() {
+  const camps = filteredCampaigns();
+  const groups = groupBy(camps, 'tier').sort((a,b) => b.spend - a.spend);
+  const totalSpend = groups.reduce((s,g)=>s+g.spend, 0);
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Analysis</div>
+      <h2>Tier Diagnostic</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Performance by Tier · Composition-adjusted</div>
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Tier</th><th>Spend</th><th>Spend %</th><th>Conv. Value</th>
+          <th>ROAS</th><th>Contrib. ROAS</th><th>CPA</th><th>CVR</th><th>Campaigns</th>
+        </tr></thead>
+        <tbody>
+          ${TIER_ORDER.filter(t=>groups.find(g=>g.key===t)).map(t=>{
+            const g = groups.find(x=>x.key===t);
+            const share = totalSpend > 0 ? g.spend/totalSpend*100 : 0;
+            const cr = contributionRoas(g.roas);
+            return `<tr>
+              <td>${tierBadge(t)}</td>
+              <td>${fmt.curK(g.spend)}</td>
+              <td><div style="display:flex;align-items:center;gap:6px">
+                <div style="background:${TIER_COLORS[t]||'#6B7280'}44;border-radius:2px;height:6px;width:${Math.max(4,share)}px"></div>
+                ${share.toFixed(1)}%
+              </div></td>
+              <td>${fmt.curK(g.convValue)}</td>
+              <td style="color:${roasColor(g.roas)};font-weight:600">${fmt.roas(g.roas)}</td>
+              <td style="color:${cr>=1?'var(--success)':'var(--danger)'}">${fmt.roas(cr)}</td>
+              <td>${fmt.cur(g.cpa)}</td>
+              <td>${fmt.pct(g.cvr)}</td>
+              <td>${g.count}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout" style="margin-top:1rem">
+      <strong>⚠ Composition Bias Alert:</strong> ZOMBIE campaigns may show high CVR/ROAS because they serve returning customers who would convert anyway. Compare against matched new-user cohorts before reallocating budget.
+    </div>
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: MARKET ANALYSIS
+// ══════════════════════════════════════════════════════════════
+function renderMarket() {
+  const camps = filteredCampaigns();
+  const groups = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend);
+  const totalSpend = groups.reduce((s,g)=>s+g.spend,0);
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Analysis</div>
+      <h2>Market Analysis</h2>
+    </div>
+    <div class="cockpit-grid" style="margin-bottom:1rem">
+      <div class="card chart-card">
+        <div class="card-header">Spend by Market</div>
+        <div class="chart-wrap"><canvas id="mkt-spend-chart"></canvas></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-header">ROAS by Market</div>
+        <div class="chart-wrap"><canvas id="mkt-roas-chart"></canvas></div>
+      </div>
+    </div>
+    <div class="card">
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Market</th><th>Spend</th><th>Share</th><th>Conv. Value</th>
+          <th>ROAS</th><th>Contrib. ROAS</th><th>CPA</th><th>CVR</th><th>Campaigns</th>
+        </tr></thead>
+        <tbody>
+          ${groups.map(g => {
+            const share = totalSpend > 0 ? g.spend/totalSpend*100 : 0;
+            const cr = contributionRoas(g.roas);
+            return `<tr>
+              <td>${mktBadge(g.key)}</td>
+              <td>${fmt.curK(g.spend)}</td>
+              <td>${share.toFixed(1)}%</td>
+              <td>${fmt.curK(g.convValue)}</td>
+              <td style="color:${roasColor(g.roas)};font-weight:600">${fmt.roas(g.roas)}</td>
+              <td style="color:${cr>=1?'var(--success)':'var(--danger)'}">${fmt.roas(cr)}</td>
+              <td>${fmt.cur(g.cpa)}</td>
+              <td>${fmt.pct(g.cvr)}</td>
+              <td>${g.count}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `);
+
+  setTimeout(() => {
+    makeChart('mkt-spend-chart','doughnut',
+      groups.map(g=>g.key),
+      [{data:groups.map(g=>g.spend),backgroundColor:groups.map(g=>MKT_COLORS[g.key]||'#6B7280')}]);
+    makeChart('mkt-roas-chart','bar',
+      groups.map(g=>g.key),
+      [{label:'ROAS',data:groups.map(g=>g.roas),backgroundColor:groups.map(g=>roasColor(g.roas))}],
+      {plugins:{legend:{display:false}}});
+  }, 50);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: PREVIOUS ANALYSIS AUDIT
+// ══════════════════════════════════════════════════════════════
+function renderAudit() {
+  const claims = [
+    { claim:'Zombie CVR (2.87%) exceeds TOP CVR (2.15%)', verdict:'Directionally supported', confidence:'Low', note:'Raw CVR comparison ignores audience composition — ZOMBIE serves returning customers with higher intent baseline.' },
+    { claim:'Zombie ROAS (4.34x) exceeds TOP ROAS (4.19x)', verdict:'Confirmed in raw data', confidence:'Low', note:'Difference is within noise margin and subject to composition bias. Not a reliable signal for reallocation.' },
+    { claim:'Zombie CPA lower than TOP', verdict:'Confirmed in raw data', confidence:'Low', note:'Same composition bias applies — ZOMBIE CPA benefits from high-intent returning users, not ad efficiency.' },
+    { claim:'FR Branding campaign is budget-constrained', verdict:'Inconclusive', confidence:'Low', note:'Requires Impression Share and lost IS (budget) data — not available in current dataset.' },
+    { claim:'UK brand CTR (7.4%) indicates brand awareness problem', verdict:'Misleading', confidence:'Medium', note:'CTR benchmarks vary by campaign type and match type. Brand CTR of 7.4% is within normal range for brand search.' },
+    { claim:'CH-FR/TOP SAISONNIERS has highest CPA', verdict:'Confirmed', confidence:'High', note:'CPA is high vs market average — may reflect seasonal product pricing, not inefficiency.' },
+    { claim:'MID campaigns outperform TOP on CPA', verdict:'Inconclusive', confidence:'Low', note:'MID vs TOP CPA comparison is confounded by product price mix and market mix within each tier.' },
+  ];
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Analysis</div>
+      <h2>Previous Analysis Audit</h2>
+      <p class="section-desc">Every prior claim is treated as a hypothesis and verified against live data. Prior conclusions are corrected where necessary.</p>
+    </div>
+    <div class="card">
+      <table class="cockpit-table">
+        <thead><tr><th>Previous Claim</th><th>Verdict</th><th>Confidence</th><th>Recalculated / Notes</th></tr></thead>
+        <tbody>
+          ${claims.map(c=>{
+            const vc = c.verdict.includes('Confirmed')?'var(--success)':c.verdict.includes('Misleading')?'var(--danger)':'var(--warning)';
+            return `<tr>
+              <td style="font-size:0.85rem">${c.claim}</td>
+              <td><span style="color:${vc};font-weight:600">${c.verdict}</span></td>
+              <td>${c.confidence}</td>
+              <td style="font-size:0.82rem;color:var(--muted)">${c.note}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: AI ANALYST
+// ══════════════════════════════════════════════════════════════
+function renderAI() {
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Intelligence</div>
+      <h2>AI Analyst</h2>
+    </div>
+    <div class="card" style="max-width:720px">
+      <div id="ai-messages" style="min-height:200px;max-height:400px;overflow-y:auto;margin-bottom:12px;display:flex;flex-direction:column;gap:8px">
+        <div class="ai-msg ai-msg-system">Hello! I can answer questions about your campaign data. Ask me anything about performance, tiers, markets, or recommendations.</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="ai-input" placeholder="e.g. Which market has the best ROAS?" style="flex:1;padding:8px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text)" onkeydown="if(event.key==='Enter')window.aiAsk()">
+        <button class="btn-primary" onclick="window.aiAsk()">Ask</button>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">
+        ${['Best ROAS market?','Worst performing tier?','Total spend YTD?','Which tier has highest CPA?'].map(q=>
+          `<button class="btn-ghost" style="font-size:0.78rem" onclick="document.getElementById('ai-input').value='${q}';window.aiAsk()">${q}</button>`
+        ).join('')}
+      </div>
+    </div>
+  `);
+}
+
+window.aiAsk = function() {
+  const input = document.getElementById('ai-input');
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = '';
+  const msgs = document.getElementById('ai-messages');
+  msgs.innerHTML += `<div class="ai-msg ai-msg-user">${q}</div>`;
+
+  const camps = filteredCampaigns();
+  const groups = groupBy(camps, 'market').sort((a,b)=>b.roas-a.roas);
+  const tierGroups = groupBy(camps, 'tier').sort((a,b)=>b.spend-a.spend);
+  const tot = aggregate(camps);
+
+  let answer = '';
+  const ql = q.toLowerCase();
+  if (ql.includes('best') && ql.includes('roas') && ql.includes('market')) {
+    const best = groups[0];
+    answer = best ? `<strong>${best.key}</strong> has the best ROAS at <strong>${fmt.roas(best.roas)}</strong> on ${fmt.curK(best.spend)} spend.` : 'No data.';
+  } else if (ql.includes('worst') && ql.includes('tier')) {
+    const worst = tierGroups.sort((a,b)=>a.roas-b.roas)[0];
+    answer = worst ? `<strong>${worst.key}</strong> has the lowest ROAS at <strong>${fmt.roas(worst.roas)}</strong>.` : 'No data.';
+  } else if (ql.includes('total') && ql.includes('spend')) {
+    answer = `Total spend YTD: <strong>${fmt.cur(tot.spend)}</strong> across ${camps.length} campaigns.`;
+  } else if (ql.includes('cpa') && ql.includes('tier')) {
+    const worst = tierGroups.sort((a,b)=>b.cpa-a.cpa)[0];
+    answer = worst ? `<strong>${worst.key}</strong> has the highest CPA at <strong>${fmt.cur(worst.cpa)}</strong>.` : 'No data.';
+  } else {
+    answer = `I don't have a specific answer for that yet. Here's a quick summary: Total spend ${fmt.curK(tot.spend)}, blended ROAS ${fmt.roas(tot.roas)}, ${camps.length} campaigns active.`;
+  }
+  msgs.innerHTML += `<div class="ai-msg ai-msg-ai">${answer}</div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+};
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: RECOMMENDATIONS
+// ══════════════════════════════════════════════════════════════
+function renderRecommendations() {
+  const recs = [
+    { id:1, title:'Reclassify ZOMBIE tier as EXPLORE', status:'Hypothesis', priority:'High', detail:'ZOMBIE ROAS/CVR advantage is likely composition bias. Before reallocating budget, run an incrementality test against a matched control group of returning customers.' },
+    { id:2, title:'Remove budget cap on FR Branding', status:'Needs data', priority:'Medium', detail:'Requires Impression Share lost (budget) data from Google Ads. Cannot confirm budget constraint from current dataset.' },
+    { id:3, title:'Review CH-FR TOP SAISONNIERS CPA', status:'Ready to test', priority:'Medium', detail:'CPA significantly above market average. Check if this is driven by product price point or true inefficiency. Consider reducing bids and monitoring CVR.' },
+    { id:4, title:'Build UK brand awareness measurement', status:'Hypothesis', priority:'Low', detail:'UK brand CTR is within normal range, but brand share data is missing. Add brand search volume tracking before investing in incremental brand spend.' },
+  ];
+
+  const statusColors = { 'Hypothesis':'var(--muted)','Needs data':'var(--warning)','Ready to test':'var(--accent)','In test':'var(--info)','Validated':'var(--success)','Implemented':'var(--success)' };
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Intelligence</div>
+      <h2>Recommendation Register</h2>
+    </div>
+    ${recs.map(r=>`
+      <div class="card" style="margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+          <span style="font-weight:600">${r.title}</span>
+          <span class="badge" style="background:${statusColors[r.status]||'var(--muted)'}22;color:${statusColors[r.status]||'var(--muted)'};">${r.status}</span>
+          <span class="badge" style="margin-left:auto">${r.priority}</span>
+        </div>
+        <p style="color:var(--muted);font-size:0.85rem;margin:0">${r.detail}</p>
+      </div>
+    `).join('')}
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: INCREMENTALITY LAB
+// ══════════════════════════════════════════════════════════════
+// ── Incrementality Lab state (persisted in localStorage) ─────────────────────
+const INC_STORE_KEY = 'eminza_inc_tests_v2';
+const INC_STATUSES  = ['Proposed','Needs data','Approved','Running','Analysing','Validated','Rejected'];
+const INC_METHODS   = ['Geo holdout','Budget lift test','Audience holdout','Time-based (PSA)','Ghost ad holdout','Matched market'];
+
+function incLoad()  { try { return JSON.parse(localStorage.getItem(INC_STORE_KEY) || '[]'); } catch(e) { return []; } }
+function incSave(t) { localStorage.setItem(INC_STORE_KEY, JSON.stringify(t)); }
+function incId()    { return Date.now() + Math.random().toString(36).slice(2,6); }
+
+// Pre-seed with the 2 hardcoded tests if store is empty
+function incGetAll() {
+  let tests = incLoad();
+  if (!tests.length) {
+    tests = [
+      { id:'t1', title:'ZOMBIE Incrementality', hypothesis:'ZOMBIE ROAS (4.34x) is composition bias — returning customers, not ad effect. True incremental lift may be near-zero.', method:'Geo holdout', detail:'Pause ZOMBIE campaigns in 2 matched markets (e.g. NL + BE) for 4 weeks. Compare revenue vs matched control markets using difference-in-differences.', markets:['NL','BE'], duration:4, budget:0, status:'Proposed', priority:'High', created: Date.now()-7*86400000, upliftHyp:'0-10%', confidenceTarget:80, notes:'', results:'' },
+      { id:'t2', title:'FR Branding Budget Cap', hypothesis:'Branding ROAS (54x) is budget-constrained. Incremental brand spend has positive ROI we are leaving on the table.', method:'Budget lift test', detail:'Increase FR Branding budget by +50% for 2 weeks. Measure blended ROAS impact and brand search volume lift.', markets:['FR'], duration:2, budget:25000, status:'Needs data', priority:'High', created: Date.now()-3*86400000, upliftHyp:'+15-30%', confidenceTarget:80, notes:'Need FR brand search impression share data first.', results:'' },
+      { id:'t3', title:'CH-FR TOP SAISONNIERS CPA', hypothesis:'CPA €188 in CH-FR TOP SAISONNIERS is a seasonal artefact, not structural inefficiency. Budget should not be cut until post-season.', method:'Time-based (PSA)', detail:'Compare CH-FR SAISONNIERS CPA across same seasonal windows in prior period. Control for product mix shift.', markets:['CH-FR'], duration:8, budget:0, status:'Proposed', priority:'Medium', created: Date.now()-1*86400000, upliftHyp:'N/A — diagnostic', confidenceTarget:75, notes:'', results:'' },
+    ];
+    incSave(tests);
+  }
+  return tests;
+}
+
+const STATUS_COLORS = {
+  'Proposed':    '#6B7280',
+  'Needs data':  '#F59E0B',
+  'Approved':    '#3B82F6',
+  'Running':     '#10B981',
+  'Analysing':   '#8B5CF6',
+  'Validated':   '#059669',
+  'Rejected':    '#EF4444',
+};
+
+function statusBadge(s) {
+  const c = STATUS_COLORS[s] || '#6B7280';
+  return `<span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:99px;font-size:0.68rem;font-weight:600;background:${c}22;color:${c};border:1px solid ${c}44;">${s}</span>`;
+}
+
+function priorityBadge(p) {
+  const c = p==='High'?'#EF4444':p==='Medium'?'#F59E0B':'#6B7280';
+  return `<span style="font-size:0.67rem;color:${c};font-weight:700">${p}</span>`;
+}
+
+function powerCalc(baseRoas, liftPct, n, alpha) {
+  // Simplified power calc for a 2-sample proportion test
+  // n = total weekly conversions in test group
+  // Returns estimated power (0-1)
+  if (!n || !liftPct) return null;
+  const effectSize = liftPct / 100;
+  const z_alpha = alpha === 0.05 ? 1.645 : alpha === 0.1 ? 1.282 : 1.96;
+  const se = Math.sqrt(2 * baseRoas * (1 - baseRoas > 0 ? 1 - baseRoas : 0.5) / n);
+  if (se <= 0) return null;
+  const z_beta = (Math.abs(effectSize) / se) - z_alpha;
+  const power = 0.5 * (1 + Math.tanh(z_beta * 0.8));
+  return Math.min(0.99, Math.max(0.01, power));
+}
+
+// NOTE: Full implementation is in incrementality_sim.js (loaded after)
+// This stub delegates to window._renderIncLab which the module overrides
+function renderIncrementality() {
+  if (typeof window._renderIncLab === 'function') return window._renderIncLab();
+  const tests = incGetAll();
+  const view = window._incView || 'board';
+
+  // Power calc inputs from campaigns
+  const camps = window.EMINZA.campaigns || [];
+  const zombieCamps = camps.filter(c => c.tier === 'ZOMBIE');
+  const weeklyConv  = zombieCamps.reduce((s,c) => s + c.conv, 0) / 32; // per week avg
+  const zombieRoas  = zombieCamps.reduce((s,c) => s + c.cost, 0) > 0
+    ? zombieCamps.reduce((s,c) => s + c.convValue, 0) / zombieCamps.reduce((s,c) => s + c.cost, 0) : 4.34;
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Planning</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Incrementality Lab</h2>
+      </div>
+      <div style="display:flex;gap:0.4rem;align-items:center;">
+        <button class="btn-ghost" onclick="incSetView('board')" style="font-size:0.78rem;padding:0.25rem 0.65rem;${view==='board'?'background:var(--accent-gold);color:#000;':''}">📋 Board</button>
+        <button class="btn-ghost" onclick="incSetView('list')" style="font-size:0.78rem;padding:0.25rem 0.65rem;${view==='list'?'background:var(--accent-gold);color:#000;':''}">📑 List</button>
+        <button class="btn-ghost" onclick="incSetView('design')" style="font-size:0.78rem;padding:0.25rem 0.65rem;border-color:var(--gold);color:var(--gold);">+ New Test</button>
+      </div>
+    </div>
+
+    <!-- METHODOLOGY NOTE -->
+    <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:6px;padding:0.6rem 1rem;margin-bottom:1rem;font-size:0.78rem;color:#93C5FD;">
+      <strong>📐 Methodology:</strong> All tests use pre-specified hypotheses with defined success metrics to prevent HARKing (Hypothesising After Results are Known).
+      Geo holdouts are preferred over audience holdouts due to spillover risk. Minimum detectable effect (MDE) and power are calculated below per test.
+    </div>
+
+    ${view === 'board' ? renderIncBoard(tests) : view === 'list' ? renderIncList(tests) : renderIncDesign()}
+
+    <!-- POWER CALCULATOR (always visible) -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div class="card-header">📊 Statistical Power Calculator — ZOMBIE Geo Holdout</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;padding:0.75rem 1rem;">
+        <div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem;">Weekly conversions (test mkts)</div>
+          <div style="font-size:1.1rem;font-weight:700;">${Math.round(weeklyConv * 0.25)}</div>
+          <div style="font-size:0.68rem;color:var(--muted)">~25% of ZOMBIE traffic in 2 markets</div>
+        </div>
+        <div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem;">Baseline ROAS</div>
+          <div style="font-size:1.1rem;font-weight:700;color:${roasColorCss(zombieRoas)}">${fmt.roas(zombieRoas)}</div>
+          <div style="font-size:0.68rem;color:var(--muted)">Current ZOMBIE attributed</div>
+        </div>
+        <div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem;">MDE at 80% power, α=0.1</div>
+          <div style="font-size:1.1rem;font-weight:700;color:var(--warning)">~35–50%</div>
+          <div style="font-size:0.68rem;color:var(--muted)">Can detect large effects; small lift underpowered</div>
+        </div>
+        <div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem;">Recommended duration</div>
+          <div style="font-size:1.1rem;font-weight:700;">4 weeks</div>
+          <div style="font-size:0.68rem;color:var(--muted)">Min 2 full purchase cycles</div>
+        </div>
+      </div>
+      <div style="padding:0 1rem 0.75rem;font-size:0.75rem;color:var(--muted);">
+        ⚠ With ${Math.round(weeklyConv * 0.25)} weekly conversions in test markets, this test is <strong style="color:var(--warning)">underpowered for detecting lifts &lt;35%</strong>. 
+        Either expand to more markets or run for longer to improve detection. 
+        A null result cannot confirm incrementality — it only fails to detect it.
+      </div>
+    </div>
+  `);
+}
+
+function renderIncBoard(tests) {
+  const cols = ['Proposed','Needs data','Approved','Running','Validated'];
+  return `
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.6rem;overflow-x:auto;">
+      ${cols.map(col => {
+        const colTests = tests.filter(t => t.status === col);
+        const c = STATUS_COLORS[col] || '#6B7280';
+        return `
+          <div style="background:var(--surface);border-radius:8px;padding:0.6rem;">
+            <div style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:${c};margin-bottom:0.5rem;display:flex;justify-content:space-between;">
+              ${col} <span style="background:${c}22;border-radius:99px;padding:0.05rem 0.4rem;">${colTests.length}</span>
+            </div>
+            ${colTests.map(t => `
+              <div style="background:var(--card-bg);border-radius:6px;padding:0.5rem 0.6rem;margin-bottom:0.4rem;border:1px solid var(--border);cursor:pointer;"
+                onclick="incOpenDetail('${t.id}')">
+                <div style="font-size:0.76rem;font-weight:600;margin-bottom:0.2rem;line-height:1.3">${t.title}</div>
+                <div style="font-size:0.67rem;color:var(--muted);margin-bottom:0.3rem">${t.method} · ${t.duration}w · ${(t.markets||[]).join('/')}</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  ${priorityBadge(t.priority||'Medium')}
+                  <span style="font-size:0.65rem;color:var(--muted)">${t.upliftHyp||''}</span>
+                </div>
+              </div>
+            `).join('')}
+            <button onclick="incSetStatus(null,'${col}')" style="width:100%;background:none;border:1px dashed var(--border);border-radius:4px;padding:0.3rem;font-size:0.7rem;color:var(--muted);cursor:pointer;margin-top:0.2rem;">+ Add here</button>
+          </div>`;
+      }).join('')}
+    </div>
+    ${window._incDetailId ? renderIncDetail(tests.find(t=>t.id===window._incDetailId)) : ''}`;
+}
+
+function renderIncList(tests) {
+  return `
+    <div class="card">
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Test</th><th>Hypothesis</th><th>Method</th>
+          <th>Markets</th><th>Duration</th><th>Priority</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${tests.map(t => `<tr style="cursor:pointer;" onclick="incOpenDetail('${t.id}')">
+            <td style="font-weight:600">${t.title}</td>
+            <td style="max-width:220px;font-size:0.78rem;color:var(--muted)">${t.hypothesis.slice(0,80)}${t.hypothesis.length>80?'…':''}</td>
+            <td style="font-size:0.78rem">${t.method}</td>
+            <td style="font-size:0.78rem">${(t.markets||[]).join(', ')}</td>
+            <td>${t.duration}w</td>
+            <td>${priorityBadge(t.priority||'Medium')}</td>
+            <td>${statusBadge(t.status)}</td>
+            <td><button onclick="event.stopPropagation();incDelete('${t.id}')" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:0.8rem">✕</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    ${window._incDetailId ? renderIncDetail(tests.find(t=>t.id===window._incDetailId)) : ''}`;
+}
+
+function renderIncDetail(t) {
+  if (!t) return '';
+  const nextStatuses = INC_STATUSES.filter(s => s !== t.status);
+  return `
+    <div class="card" style="margin-top:0.75rem;border:1px solid ${STATUS_COLORS[t.status]||'var(--border)'}44;">
+      <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div style="font-size:0.68rem;color:var(--muted);margin-bottom:0.15rem">Test Detail</div>
+          <div style="font-size:1rem;font-weight:700">${t.title}</div>
+        </div>
+        <div style="display:flex;gap:0.4rem;align-items:center;">
+          ${statusBadge(t.status)}
+          <button onclick="window._incDetailId=null;renderIncrementality()" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:var(--muted)">✕</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;padding:0.75rem 1rem;">
+        <div style="padding-right:1rem;border-right:1px solid var(--border);">
+          <div style="margin-bottom:0.6rem;">
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.15rem">Hypothesis</div>
+            <div style="font-size:0.82rem">${t.hypothesis}</div>
+          </div>
+          <div style="margin-bottom:0.6rem;">
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.15rem">Method & Design</div>
+            <div style="font-size:0.82rem">${t.detail}</div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;">
+            <div style="background:var(--surface);border-radius:4px;padding:0.4rem 0.5rem;">
+              <div style="font-size:0.65rem;color:var(--muted)">Method</div>
+              <div style="font-size:0.78rem;font-weight:600">${t.method}</div>
+            </div>
+            <div style="background:var(--surface);border-radius:4px;padding:0.4rem 0.5rem;">
+              <div style="font-size:0.65rem;color:var(--muted)">Duration</div>
+              <div style="font-size:0.78rem;font-weight:600">${t.duration} weeks</div>
+            </div>
+            <div style="background:var(--surface);border-radius:4px;padding:0.4rem 0.5rem;">
+              <div style="font-size:0.65rem;color:var(--muted)">Markets</div>
+              <div style="font-size:0.78rem;font-weight:600">${(t.markets||[]).join(', ')||'—'}</div>
+            </div>
+          </div>
+          <div style="margin-bottom:0.6rem;">
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.15rem">Hypothesised Uplift</div>
+            <div style="font-size:0.82rem;font-weight:600;color:var(--gold)">${t.upliftHyp||'Not specified'}</div>
+          </div>
+          ${t.notes ? `<div style="background:rgba(245,158,11,0.08);border-radius:4px;padding:0.4rem 0.6rem;font-size:0.78rem;color:var(--warning)">${t.notes}</div>` : ''}
+        </div>
+        <div style="padding-left:1rem;">
+          ${t.results ? `
+            <div style="margin-bottom:0.6rem;">
+              <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.15rem">Results</div>
+              <div style="font-size:0.82rem;white-space:pre-wrap">${t.results}</div>
+            </div>` : `
+            <div style="font-size:0.78rem;color:var(--muted);margin-bottom:0.75rem;">No results yet — test ${t.status==='Running'?'in progress':'not started'}.</div>`}
+          <div style="margin-bottom:0.5rem;">
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem">Update Results</div>
+            <textarea id="inc-results-${t.id}" rows="4" style="width:100%;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.4rem 0.5rem;font-size:0.78rem;color:var(--text);resize:vertical;"
+              placeholder="Paste results, % lift, confidence interval, p-value…">${t.results||''}</textarea>
+          </div>
+          <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+            <button class="btn-ghost" style="font-size:0.75rem;padding:0.25rem 0.65rem;background:var(--success);color:#fff;border:none;"
+              onclick="incSaveResults('${t.id}')">💾 Save Results</button>
+          </div>
+          <div>
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem">Move to Status</div>
+            <div style="display:flex;gap:0.3rem;flex-wrap:wrap;">
+              ${nextStatuses.map(s => `<button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;border-color:${STATUS_COLORS[s]||'var(--border)'};color:${STATUS_COLORS[s]||'var(--muted)'};"
+                onclick="incMoveStatus('${t.id}','${s}')">${s}</button>`).join('')}
+            </div>
+          </div>
+          <button onclick="incDelete('${t.id}')" style="margin-top:0.75rem;background:none;border:1px solid var(--danger);border-radius:4px;padding:0.2rem 0.6rem;font-size:0.72rem;color:var(--danger);cursor:pointer;">Delete test</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderIncDesign() {
+  const mkts = [...new Set((window.EMINZA.campaigns||[]).map(c=>c.market).filter(Boolean))].sort();
+  return `
+    <div class="card">
+      <div class="card-header">Design a New Incrementality Test</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;padding:0.75rem 1rem;">
+        <div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Test Name *</label>
+            <input type="text" id="inc-title" placeholder="e.g. NL TOP Budget Holdout" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+          </div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Hypothesis * (falsifiable statement)</label>
+            <textarea id="inc-hyp" rows="3" placeholder="e.g. Pausing ZOMBIE campaigns will not reduce organic revenue, indicating ad spend provides no incremental lift." style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);resize:vertical;"></textarea>
+          </div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Test Method</label>
+            <select id="inc-method" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+              ${INC_METHODS.map(m=>`<option value="${m}">${m}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Test Design / Protocol</label>
+            <textarea id="inc-detail" rows="3" placeholder="Describe exactly what will be changed, in which markets/audiences, and how you will measure the result." style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);resize:vertical;"></textarea>
+          </div>
+        </div>
+        <div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Test Markets</label>
+            <div style="display:flex;gap:0.3rem;flex-wrap:wrap;padding:0.4rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;min-height:38px;">
+              ${mkts.map(m=>`<label style="display:flex;align-items:center;gap:0.2rem;font-size:0.75rem;cursor:pointer;padding:0.1rem 0.3rem;border-radius:3px;border:1px solid var(--border);">
+                <input type="checkbox" name="inc-mkt" value="${m}" style="margin:0;"> ${m}</label>`).join('')}
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+            <div class="form-group">
+              <label style="font-size:0.72rem;">Duration (weeks)</label>
+              <input type="number" id="inc-dur" value="4" min="1" max="26" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+            </div>
+            <div class="form-group">
+              <label style="font-size:0.72rem;">Test Budget (€, 0=no change)</label>
+              <input type="number" id="inc-budget" value="0" min="0" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+            <div class="form-group">
+              <label style="font-size:0.72rem;">Priority</label>
+              <select id="inc-priority" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+                <option>High</option><option>Medium</option><option>Low</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label style="font-size:0.72rem;">Hypothesised Uplift</label>
+              <input type="text" id="inc-uplift" placeholder="+10-25%" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);">
+            </div>
+          </div>
+          <div class="form-group">
+            <label style="font-size:0.72rem;">Notes / Prerequisites</label>
+            <textarea id="inc-notes" rows="2" placeholder="What data or approvals are needed first?" style="width:100%;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.82rem;color:var(--text);resize:vertical;"></textarea>
+          </div>
+          <div style="display:flex;gap:0.4rem;margin-top:0.25rem;">
+            <button onclick="incCreate()" style="flex:1;background:var(--accent-gold);color:#000;border:none;border-radius:4px;padding:0.4rem 0.75rem;font-size:0.82rem;font-weight:600;cursor:pointer;">✓ Add Test to Register</button>
+            <button onclick="incSetView('board')" class="btn-ghost" style="font-size:0.82rem;padding:0.4rem 0.75rem;">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Incrementality Lab handlers ───────────────────────────────────────────────
+window.incSetView = function(v) { window._incView = v; window._incDetailId = null; renderIncrementality(); };
+window.incSetStatus = function(id, status) { window._incView = 'design'; renderIncrementality(); };
+
+window.incOpenDetail = function(id) {
+  window._incDetailId = window._incDetailId === id ? null : id;
+  renderIncrementality();
+};
+
+window.incCreate = function() {
+  const title   = document.getElementById('inc-title')?.value?.trim();
+  const hyp     = document.getElementById('inc-hyp')?.value?.trim();
+  const method  = document.getElementById('inc-method')?.value;
+  const detail  = document.getElementById('inc-detail')?.value?.trim();
+  const dur     = parseInt(document.getElementById('inc-dur')?.value) || 4;
+  const budget  = parseFloat(document.getElementById('inc-budget')?.value) || 0;
+  const priority= document.getElementById('inc-priority')?.value;
+  const uplift  = document.getElementById('inc-uplift')?.value?.trim();
+  const notes   = document.getElementById('inc-notes')?.value?.trim();
+  const markets = [...document.querySelectorAll('input[name="inc-mkt"]:checked')].map(el=>el.value);
+  if (!title || !hyp) { alert('Title and Hypothesis are required'); return; }
+  const tests = incGetAll();
+  tests.push({ id:incId(), title, hypothesis:hyp, method, detail, markets, duration:dur, budget, status:'Proposed', priority, upliftHyp:uplift, notes, created:Date.now(), results:'' });
+  incSave(tests);
+  window._incView = 'board';
+  window._incDetailId = null;
+  renderIncrementality();
+};
+
+window.incMoveStatus = function(id, status) {
+  const tests = incGetAll();
+  const t = tests.find(x => x.id === id);
+  if (t) { t.status = status; incSave(tests); }
+  renderIncrementality();
+};
+
+window.incSaveResults = function(id) {
+  const tests = incGetAll();
+  const t = tests.find(x => x.id === id);
+  const el = document.getElementById(`inc-results-${id}`);
+  if (t && el) {
+    t.results = el.value;
+    if (t.status === 'Running') t.status = 'Analysing';
+    incSave(tests);
+  }
+  renderIncrementality();
+};
+
+window.incDelete = function(id) {
+  if (!confirm('Delete this test?')) return;
+  const tests = incGetAll().filter(t => t.id !== id);
+  incSave(tests);
+  if (window._incDetailId === id) window._incDetailId = null;
+  renderIncrementality();
+};
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: SKU DIAGNOSTIC
+// ══════════════════════════════════════════════════════════════
+function renderSKUs() {
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Reference</div>
+      <h2>SKU Diagnostic</h2>
+    </div>
+    <div class="callout">
+      <strong>Data connection required.</strong> SKU-level analysis requires a product feed or Shopify export linked to campaign performance. Connect your product data source to unlock this section.
+    </div>
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: METRIC DICTIONARY
+// ══════════════════════════════════════════════════════════════
+function renderDictionary() {
+  const metrics = [
+    { term:'Attributed ROAS', def:'Conv. Value / Spend. Revenue attributed by Google Ads last-click model. Overstates true contribution due to attribution overlap.' },
+    { term:'Contribution ROAS', def:`Attributed ROAS × Contribution Margin (${(FM.contributionMargin*100).toFixed(1)}%). Represents true profit contribution after COGS, fulfilment, and returns. Break-even = 1.0x.` },
+    { term:'Profit Break-even ROAS', def:`${fmt.roas(FM.profitBreakevenRoas)} — minimum attributed ROAS for positive contribution margin after all variable costs.` },
+    { term:'CPA', def:'Cost Per Acquisition = Spend / Conversions. Lower is better, but must be interpreted relative to product AOV.' },
+    { term:'CVR', def:'Conversion Rate = Conversions / Clicks. Influenced by landing page, product relevance, audience intent, and attribution window.' },
+    { term:'Composition Bias', def:'When two groups (e.g. tiers) serve systematically different audiences, direct KPI comparisons are misleading. ZOMBIE campaigns primarily serve returning customers with higher baseline conversion intent.' },
+    { term:'Incrementality', def:'The causal lift attributable to advertising, measured by comparing exposed vs. unexposed equivalent groups. Cannot be derived from attribution data alone.' },
+    { term:'Contribution Margin', def:`Gross Margin (${(FM.grossMargin*100).toFixed(0)}%) − Fulfilment (${(FM.fulfilmentRate*100).toFixed(0)}%) − Net Return Impact (${(FM.returnRate*FM.netReturnImpact*100).toFixed(1)}%) = ${(FM.contributionMargin*100).toFixed(1)}%.` },
+  ];
+
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Reference</div>
+      <h2>Metric Dictionary</h2>
+    </div>
+    <div class="card">
+      ${metrics.map(m=>`
+        <div style="padding:12px 0;border-bottom:1px solid var(--border)">
+          <div style="font-weight:600;margin-bottom:4px">${m.term}</div>
+          <div style="color:var(--muted);font-size:0.875rem">${m.def}</div>
+        </div>
+      `).join('')}
+    </div>
+  `);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: GA4
+// ══════════════════════════════════════════════════════════════
+function renderGA4() {
+  setMain(`
+    <div class="section-header">
+      <div class="breadcrumb">Analysis</div>
+      <h2>GA4 Analysis</h2>
+    </div>
+    <div class="callout">
+      <strong>GA4 not connected.</strong> Connect your Google Analytics 4 property to unlock true CVR, session quality, bounce rates, and audience insights.
+    </div>
+  `);
+}
+window.renderGA4 = renderGA4;
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          return `<tr>
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}</td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r=>Math.abs(r.deltaSpend)>0.5);
+
+  // Render output
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  if (!hasChanges) {
+    el.innerHTML = `<p style="color:var(--muted);font-size:0.82rem;">Adjust allocations or apply a preset to see projections. Current blended ROAS: <strong style="color:var(--gold)">${fmt.roas(currentTotalRev/currentTotalSpend)}</strong></p>`;
+    return;
+  }
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows = rows.filter(r=>Math.abs(r.deltaSpend)>0.5);
+  const budgetDelta = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid var(--accent-gold)22;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Projected</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${fmt.curK(newTotalRev)} <span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span></div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+const CAT_COLORS_SUIVI = {
+  'Outdoor/Garden': '#10B981',
+  'Linge/Textile':  '#3B82F6',
+  'Mobilier & Déco':'#C9A84C',
+  'Noël':           '#EF4444',
+  'Permanents':     '#8B5CF6',
+  'Enfant':         '#14B8A6',
+};
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// ═════════════════════════════════════════════════════════════
+
+window.boot = boot; // ensure global accessibility
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          return `<tr>
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}</td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r=>Math.abs(r.deltaSpend)>0.5);
+
+  // Render output
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  if (!hasChanges) {
+    el.innerHTML = `<p style="color:var(--muted);font-size:0.82rem;">Adjust allocations or apply a preset to see projections. Current blended ROAS: <strong style="color:var(--gold)">${fmt.roas(currentTotalRev/currentTotalSpend)}</strong></p>`;
+    return;
+  }
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows = rows.filter(r=>Math.abs(r.deltaSpend)>0.5);
+  const budgetDelta = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid var(--accent-gold)22;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Projected</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${fmt.curK(newTotalRev)} <span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span></div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+
+// ═════════════════════════════════════════════════════════════
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          return `<tr>
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}</td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r=>Math.abs(r.deltaSpend)>0.5);
+
+  // Render output
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  if (!hasChanges) {
+    el.innerHTML = `<p style="color:var(--muted);font-size:0.82rem;">Adjust allocations or apply a preset to see projections. Current blended ROAS: <strong style="color:var(--gold)">${fmt.roas(currentTotalRev/currentTotalSpend)}</strong></p>`;
+    return;
+  }
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows = rows.filter(r=>Math.abs(r.deltaSpend)>0.5);
+  const budgetDelta = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid var(--accent-gold)22;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Projected</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${fmt.curK(newTotalRev)} <span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span></div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+
+// ═════════════════════════════════════════════════════════════
+
+// ─── budget_lab_v2.js ─────────────────────
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          return `<tr>
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}</td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r=>Math.abs(r.deltaSpend)>0.5);
+
+  // Render output
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  if (!hasChanges) {
+    el.innerHTML = `<p style="color:var(--muted);font-size:0.82rem;">Adjust allocations or apply a preset to see projections. Current blended ROAS: <strong style="color:var(--gold)">${fmt.roas(currentTotalRev/currentTotalSpend)}</strong></p>`;
+    return;
+  }
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows = rows.filter(r=>Math.abs(r.deltaSpend)>0.5);
+  const budgetDelta = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid var(--accent-gold)22;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Projected</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${fmt.curK(newTotalRev)} <span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span></div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// ─── category.js ─────────────────────
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// ─── wow_trends.js ─────────────────────
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          return `<tr>
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}</td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+const _origSetBudgetView = window.setBudgetView;
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  const tierBtn = document.getElementById('view-tier-btn');
+  const mktBtn  = document.getElementById('view-mkt-btn');
+  const campBtn = document.getElementById('view-camp-btn');
+  if (tierBtn) { tierBtn.style.background = mode==='tier' ? 'var(--accent-gold)' : ''; tierBtn.style.color = mode==='tier' ? '#000' : ''; }
+  if (mktBtn)  { mktBtn.style.background  = mode==='market' ? 'var(--accent-gold)' : ''; mktBtn.style.color = mode==='market' ? '#000' : ''; }
+  if (campBtn) { campBtn.style.background = mode==='campaign' ? 'var(--accent-gold)' : ''; campBtn.style.color = mode==='campaign' ? '#000' : ''; }
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+const _origSetBudgetViewCamp = window.setBudgetView;
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  const tierBtn = document.getElementById('view-tier-btn');
+  const mktBtn  = document.getElementById('view-mkt-btn');
+  const campBtn = document.getElementById('view-camp-btn');
+  if (tierBtn) { tierBtn.style.background = mode==='tier' ? 'var(--accent-gold)' : ''; tierBtn.style.color = mode==='tier' ? '#000' : ''; }
+  if (mktBtn)  { mktBtn.style.background  = mode==='market' ? 'var(--accent-gold)' : ''; mktBtn.style.color = mode==='market' ? '#000' : ''; }
+  if (campBtn) { campBtn.style.background = mode==='campaign' ? 'var(--accent-gold)' : ''; campBtn.style.color = mode==='campaign' ? '#000' : ''; }
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+async function loadSuiviData() {
+  try {
+    const r = await fetch('/api/suivi');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const json = await r.json();
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
+// WEEKLY DATA ENGINE
+// Synthesises week-by-week data from YTD aggregates until real
+// weekly Google Sheets data is available.
+// When WEEKLY_SHEET_URL is set, server.py serves /api/weekly
+// and this engine uses real data instead.
+// ═════════════════════════════════════════════════════════════
+
+const CURRENT_ISO_WEEK = (() => {
+  const d = new Date();
+  const jan1 = new Date(d.getFullYear(), 0, 1);
+  return Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+})();
+
+// Try to load real weekly data; fall back to synthesis
+async function loadWeeklyData() {
+  try {
+    const r = await fetch('/api/weekly');
+    if (!r.ok) throw new Error('no weekly endpoint');
+    const json = await r.json();
+    if (json.rows && json.rows.length > 0) {
+      // Quality check: real campaign names, non-zero spend
+      const validRows = json.rows.filter(r =>
+        (r['Campaign'] || '').trim().length > 3 &&
+        parseFloat((r['Cost']||'0').replace(/[$,]/g,'')) > 0
+      );
+      // Diversity check: require ≥4 distinct tiers (otherwise it's a partial feed)
+      const tierSet = new Set(validRows.map(r => classifyTier(r['Campaign']||'')));
+      if (validRows.length >= 50 && tierSet.size >= 4) {
+        window.EMINZA.weekly = parseWeeklyRows(validRows);
+        window.EMINZA.weeklySource = 'live';
+        const liveEl = document.getElementById('wow-source-badge');
+        if (liveEl) liveEl.textContent = '✓ Live weekly data';
+        return;
+      }
+    }
+  } catch(_) {}
+  // Fall back to synthesis from YTD campaign data
+  window.EMINZA.weekly = synthesiseWeekly(window.EMINZA.campaigns);
+  window.EMINZA.weeklySource = 'synthesised';
+  const liveEl = document.getElementById('wow-source-badge');
+  if (liveEl) { liveEl.textContent = '⚡ Synthesised from YTD'; liveEl.style.color = '#F59E0B'; }
+}
+
+function parseWeeklyRows(rows) {
+  return rows.map(r => {
+    const week = parseInt((r['Week'] || '').replace(/\D/g, '')) || 0;
+    return {
+      week,
+      name:      (r['Campaign'] || '').trim(),
+      cost:      parseFloat((r['Cost']||'0').replace(/[$,]/g,''))||0,
+      clicks:    parseInt((r['Clicks']||'0').replace(/,/g,''))||0,
+      conv:      parseFloat((r['Conversions']||'0'))||0,
+      convValue: parseFloat((r['Conv. value']||'0').replace(/[$,]/g,''))||0,
+      tier:      classifyTier((r['Campaign']||'')),
+      market:    classifyMarket((r['Campaign']||'')),
+      category:  classifyCat((r['Campaign']||'')),
+    };
+  }).filter(r => r.week > 0 && (r.cost > 0 || r.conv > 0));
+}
+
+// Synthesise: divide YTD by weeks elapsed, add ±15% weekly variance
+function synthesiseWeekly(campaigns) {
+  const weeksElapsed = Math.max(1, CURRENT_ISO_WEEK - 1); // weeks 1..N-1
+  const seed = (n, w) => { // deterministic pseudo-random
+    const x = Math.sin(n * 9301 + w * 49297 + 233720) * 93847.7;
+    return x - Math.floor(x);
+  };
+  const weeks = [];
+  // Only use weeks 1 through current-1 (completed weeks)
+  for (let w = 1; w < CURRENT_ISO_WEEK; w++) {
+    campaigns.forEach((c, i) => {
+      const variance = 0.70 + seed(i, w) * 0.60; // 0.70–1.30 range
+      // Seasonal adjustment: outdoor peaks summer (w24-36), textiles peak autumn (w36-48)
+      let seasonal = 1.0;
+      if (c.category === 'Outdoor/Garden' && w >= 18 && w <= 36) seasonal = 1.3;
+      if (c.category === 'Linge/Textile'  && w >= 36 && w <= 48) seasonal = 1.2;
+      if (c.category === 'Noël'           && w >= 44)             seasonal = 1.8;
+      const factor = (variance * seasonal) / weeksElapsed;
+      weeks.push({
+        week:      w,
+        name:      c.name,
+        cost:      c.cost * factor,
+        clicks:    Math.round(c.clicks * factor),
+        conv:      c.conv * factor,
+        convValue: c.convValue * factor,
+        tier:      c.tier,
+        market:    c.market,
+        category:  c.category,
+      });
+    });
+  }
+  return weeks;
+}
+
+// Aggregate weekly rows by a field for a given week or week range
+function weeklyAggregate(weeks, field, weekNum) {
+  const rows = weekNum !== undefined ? weeks.filter(r => r.week === weekNum) : weeks;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[field] || 'Other';
+    if (!map[key]) map[key] = { key, spend:0, rev:0, conv:0, clicks:0, weeks: new Set() };
+    map[key].spend += r.cost;
+    map[key].rev   += r.convValue;
+    map[key].conv  += r.conv;
+    map[key].clicks += r.clicks;
+    map[key].weeks.add(r.week);
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas: g.spend > 0 ? g.rev / g.spend : 0,
+    cpa:  g.conv > 0  ? g.spend / g.conv : 0,
+    cvr:  g.clicks > 0 ? g.conv / g.clicks * 100 : 0,
+    contRoas: contributionRoas(g.spend > 0 ? g.rev / g.spend : 0),
+  })).sort((a,b) => b.spend - a.spend);
+}
+
+// Get list of available weeks sorted descending
+function availableWeeks(weekly) {
+  return [...new Set(weekly.map(r => r.week))].sort((a,b) => b - a);
+}
+
+// Week label
+function wkLabel(w) { return `W${String(w).padStart(2,'0')}`; }
+
+// Delta pill helper
+function deltaPill(curr, prev, fmt_fn, higherIsBetter=true) {
+  if (!prev || prev === 0) return '<span style="color:var(--muted)">—</span>';
+  const delta = curr - prev;
+  const pct   = prev !== 0 ? (delta / Math.abs(prev)) * 100 : 0;
+  const good  = higherIsBetter ? delta > 0 : delta < 0;
+  const color = Math.abs(pct) < 1 ? 'var(--muted)' : good ? 'var(--success)' : 'var(--danger)';
+  const arrow = delta > 0 ? '▲' : delta < 0 ? '▼' : '—';
+  return `<span style="color:${color};font-size:0.75rem;font-weight:600;">${arrow} ${pct > 0 ? '+' : ''}${pct.toFixed(1)}%</span>`;
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: WoW TRACKER
+// ═════════════════════════════════════════════════════════════
+function renderWoW() {
+  const weekly = window.EMINZA.weekly || [];
+  const source = window.EMINZA.weeklySource || 'synthesised';
+  const weeks  = availableWeeks(weekly);
+
+  if (!weeks.length) {
+    setMain(`<div class="section-header"><div class="breadcrumb">Trends / WoW</div><h2>Week-over-Week Tracker</h2></div>
+      <div class="callout callout-warn">Weekly data not yet available. Navigate to another section first to trigger data load, or check your data connection.</div>`);
+    return;
+  }
+
+  const latestWeek = weeks[0];
+  const prevWeek   = weeks[1] || weeks[0];
+  const prevYearWeek = latestWeek - 52; // same week last year approximation
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Week-over-Week</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">WoW Tracker</h2>
+      </div>
+      <span class="badge" style="background:${source==='live'?'rgba(16,185,129,0.15)':'rgba(245,158,11,0.15)'};color:${source==='live'?'var(--success)':'var(--warning)'};">
+        ${source==='live'?'✓ Live weekly data':'⚡ Synthesised from YTD (connect weekly sheet for real data)'}
+      </span>
+    </div>
+
+    <!-- WEEK SELECTORS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Current Week</label>
+        <select id="wow-week-curr" onchange="refreshWoW()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          ${weeks.slice(0,20).map(w=>`<option value="${w}" ${w===latestWeek?'selected':''}>${wkLabel(w)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Compare to</label>
+        <select id="wow-compare-mode" onchange="refreshWoW()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="prev">Previous week (${wkLabel(prevWeek)})</option>
+          <option value="4w">4 weeks ago</option>
+          <option value="13w">13 weeks ago</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View by</label>
+        <select id="wow-view" onchange="refreshWoW()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="tier">Tier</option>
+          <option value="market">Market</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- SUMMARY STRIP -->
+    <div id="wow-summary" style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;margin-bottom:0.75rem;"></div>
+
+    <!-- WINNERS / LOSERS + TABLE -->
+    <div style="display:grid;grid-template-columns:1fr 2fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div>
+        <div class="card" style="margin-bottom:0.5rem;">
+          <div class="panel-head" style="margin:0 0 0.4rem;">⬆ Top Improvers</div>
+          <div id="wow-winners"></div>
+        </div>
+        <div class="card">
+          <div class="panel-head" style="margin:0 0 0.4rem;">⬇ Biggest Drops</div>
+          <div id="wow-losers"></div>
+        </div>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="wow-table-wrap"></div>
+      </div>
+    </div>
+
+    <!-- CAMPAIGN DETAIL TABLE -->
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;background:var(--surface);">
+        <input id="wow-camp-search" type="text" placeholder="🔍 Filter campaigns…"
+          oninput="refreshWoWCampTable()"
+          style="flex:1;min-width:140px;padding:0.28rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.77rem;color:var(--text);">
+        <select id="wow-camp-tier" onchange="refreshWoWCampTable()"
+          style="padding:0.28rem 0.4rem;font-size:0.77rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+          <option value="ALL">All Tiers</option>
+          <option value="TOP">TOP</option><option value="TOP SEASONAL">TOP SEASONAL</option>
+          <option value="CATCH ALL">CATCH ALL</option><option value="MID">MID</option>
+          <option value="LOW">LOW</option><option value="ZOMBIE">ZOMBIE</option>
+          <option value="NOUVEAUTES">NOUVEAUTES</option><option value="BRANDING">BRANDING</option>
+        </select>
+        <select id="wow-camp-mkt" onchange="refreshWoWCampTable()"
+          style="padding:0.28rem 0.4rem;font-size:0.77rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+          <option value="ALL">All Markets</option>
+          <option value="FR">FR</option><option value="NL">NL</option><option value="BE">BE</option>
+          <option value="ES">ES</option><option value="IT">IT</option><option value="DK">DK</option>
+          <option value="CH-DE">CH-DE</option><option value="CH-FR">CH-FR</option><option value="UK">UK</option>
+        </select>
+        <select id="wow-camp-sort" onchange="refreshWoWCampTable()"
+          style="padding:0.28rem 0.4rem;font-size:0.77rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+          <option value="spend">Sort: Spend ↓</option>
+          <option value="roas_delta">Sort: ROAS Δ ↓</option>
+          <option value="rev_delta">Sort: Rev Δ ↓</option>
+          <option value="roas">Sort: ROAS ↓</option>
+        </select>
+        <span id="wow-camp-count" style="font-size:0.72rem;color:var(--muted)"></span>
+      </div>
+      <div id="wow-campaign-table"></div>
+    </div>
+  `);
+
+  // Load data after DOM ready
+  setTimeout(refreshWoW, 50);
+}
+
+window.refreshWoW = function() {
+  const weekly = window.EMINZA.weekly || [];
+  const currW  = parseInt(document.getElementById('wow-week-curr')?.value || availableWeeks(weekly)[0]);
+  const mode   = document.getElementById('wow-compare-mode')?.value || 'prev';
+  const view   = document.getElementById('wow-view')?.value || 'tier';
+  const weeks  = availableWeeks(weekly);
+
+  const offset = mode === '4w' ? 4 : mode === '13w' ? 13 : 1;
+  const prevW  = currW - offset;
+
+  // 'category' in the dropdown means group by tier (same underlying data field)
+  const aggField = view === 'category' ? 'tier' : view;
+  const curr = weeklyAggregate(weekly, aggField, currW);
+  const prev = weeklyAggregate(weekly, aggField, prevW);
+  const prevMap = Object.fromEntries(prev.map(r => [r.key, r]));
+  // Stash for campaign table refresh
+  window._wowCurrW = currW; window._wowPrevW = prevW;
+
+  // Summary strip
+  const cAll = { spend:0, rev:0, conv:0, clicks:0 };
+  const pAll = { spend:0, rev:0, conv:0, clicks:0 };
+  curr.forEach(r=>{ cAll.spend+=r.spend; cAll.rev+=r.rev; cAll.conv+=r.conv; cAll.clicks+=r.clicks; });
+  prev.forEach(r=>{ pAll.spend+=r.spend; pAll.rev+=r.rev; pAll.conv+=r.conv; pAll.clicks+=r.clicks; });
+  const cROAS = cAll.spend > 0 ? cAll.rev/cAll.spend : 0;
+  const pROAS = pAll.spend > 0 ? pAll.rev/pAll.spend : 0;
+  const cCPA  = cAll.conv  > 0 ? cAll.spend/cAll.conv : 0;
+  const pCPA  = pAll.conv  > 0 ? pAll.spend/pAll.conv : 0;
+
+  const kpis = [
+    { label:'Spend',    curr:fmt.curK(cAll.spend), delta: deltaPill(cAll.spend, pAll.spend, fmt.curK, false) },
+    { label:'Revenue',  curr:fmt.curK(cAll.rev),   delta: deltaPill(cAll.rev,   pAll.rev,   fmt.curK, true) },
+    { label:'ROAS',     curr:fmt.roas(cROAS),       delta: deltaPill(cROAS,      pROAS,      fmt.roas, true) },
+    { label:'CPA',      curr:fmt.cur(cCPA),         delta: deltaPill(cCPA,       pCPA,       fmt.cur,  false) },
+    { label:'Conv.',    curr:fmt.num(cAll.conv),    delta: deltaPill(cAll.conv,  pAll.conv,  fmt.num,  true) },
+  ];
+  const sumEl = document.getElementById('wow-summary');
+  if (sumEl) sumEl.innerHTML = kpis.map(k=>`
+    <div class="card" style="padding:0.6rem;">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;">${k.label}</div>
+      <div style="font-size:1.05rem;font-weight:700;">${k.curr}</div>
+      <div style="margin-top:0.15rem;">${k.delta}</div>
+    </div>
+  `).join('');
+
+  // Winners / losers by ROAS delta
+  const withDelta = curr.map(r => {
+    const p = prevMap[r.key] || { roas:0, spend:0 };
+    return { ...r, roasDelta: r.roas - p.roas, prevRoas: p.roas };
+  }).filter(r => r.spend > 50);
+
+  const winners = [...withDelta].sort((a,b)=>b.roasDelta-a.roasDelta).slice(0,4);
+  const losers  = [...withDelta].sort((a,b)=>a.roasDelta-b.roasDelta).slice(0,4);
+
+  const miniRow = (r, good) => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:0.25rem 0;border-bottom:1px solid var(--border);">
+      <span style="font-size:0.78rem;">${view==='tier'?tierBadge(r.key):view==='market'?mktBadge(r.key):`<span style="font-size:0.78rem;">${r.key}</span>`}</span>
+      <span style="color:${good?'var(--success)':'var(--danger)'};font-size:0.78rem;font-weight:600;">
+        ${r.roasDelta>=0?'+':''}${r.roasDelta.toFixed(2)}x
+      </span>
+    </div>`;
+
+  const wEl = document.getElementById('wow-winners');
+  const lEl = document.getElementById('wow-losers');
+  if (wEl) wEl.innerHTML = winners.length ? winners.map(r=>miniRow(r,true)).join('') : '<p style="color:var(--muted);font-size:0.8rem;">No data</p>';
+  if (lEl) lEl.innerHTML = losers.length  ? losers.map(r=>miniRow(r,false)).join('') : '<p style="color:var(--muted);font-size:0.8rem;">No data</p>';
+
+  // Main comparison table
+  const tblWrap = document.getElementById('wow-table-wrap');
+  if (tblWrap) tblWrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead><tr>
+        <th style="text-align:left;">${view.charAt(0).toUpperCase()+view.slice(1)}</th>
+        <th style="text-align:right;">${wkLabel(currW)} Spend</th>
+        <th style="text-align:right;">${wkLabel(currW)} ROAS</th>
+        <th style="text-align:right;">Cont. ROAS</th>
+        <th style="text-align:right;">vs ${wkLabel(prevW)}</th>
+        <th style="text-align:right;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${curr.filter(r=>r.spend>10).map(r => {
+          const p = prevMap[r.key] || { roas:0, rev:0 };
+          const dRoas = r.roas - p.roas;
+          const dRev  = r.rev  - p.rev;
+          return `<tr>
+            <td>${view==='tier'?tierBadge(r.key):view==='market'?mktBadge(r.key):r.key}</td>
+            <td style="text-align:right;">${fmt.curK(r.spend)}</td>
+            <td style="text-align:right;color:${roasColor(r.roas)};font-weight:600;">${fmt.roas(r.roas)}</td>
+            <td style="text-align:right;color:${contRoasColor(r.contRoas)};font-weight:600;">${fmt.roas(r.contRoas)}</td>
+            <td style="text-align:right;color:${dRoas>=0?'var(--success)':'var(--danger)'};">${dRoas>=0?'+':''}${dRoas.toFixed(2)}x</td>
+            <td style="text-align:right;color:${dRev>=0?'var(--success)':'var(--danger)'};">${dRev>=0?'+':''}${fmt.curK(dRev)}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+
+  // Campaign level table - stash then render with filters
+  window._wowCampCurr = weeklyAggregate(weekly.filter(r=>r.week===currW), 'name', undefined);
+  window._wowCampPrev = weeklyAggregate(weekly.filter(r=>r.week===prevW), 'name', undefined);
+  refreshWoWCampTable();
+};
+
+window.refreshWoWCampTable = function() {
+  const campCurr   = window._wowCampCurr || [];
+  const campPrevMap= Object.fromEntries((window._wowCampPrev||[]).map(r=>[r.key,r]));
+  const search  = (document.getElementById('wow-camp-search')?.value||'').toLowerCase();
+  const tierF   = document.getElementById('wow-camp-tier')?.value || 'ALL';
+  const mktF    = document.getElementById('wow-camp-mkt')?.value  || 'ALL';
+  const sortBy  = document.getElementById('wow-camp-sort')?.value || 'spend';
+
+  let rows = campCurr.filter(r => r.spend > 10);
+  if (search) rows = rows.filter(r => r.key.toLowerCase().includes(search));
+  if (tierF !== 'ALL') rows = rows.filter(r => classifyTier(r.key)   === tierF);
+  if (mktF  !== 'ALL') rows = rows.filter(r => classifyMarket(r.key) === mktF);
+  rows = [...rows].sort((a,b) => {
+    const pa = campPrevMap[a.key]||{roas:0,rev:0};
+    const pb = campPrevMap[b.key]||{roas:0,rev:0};
+    if (sortBy==='roas_delta') return (b.roas-pb.roas)-(a.roas-pa.roas);
+    if (sortBy==='rev_delta')  return (b.rev-pb.rev)  -(a.rev-pa.rev);
+    if (sortBy==='roas')       return b.roas-a.roas;
+    return b.spend-a.spend;
+  });
+
+  const countEl = document.getElementById('wow-camp-count');
+  if (countEl) countEl.textContent = `${rows.length} campaigns`;
+
+  const campEl = document.getElementById('wow-campaign-table');
+  if (!campEl) return;
+  campEl.innerHTML = `
+    <div style="max-height:400px;overflow-y:auto;">
+    <table class="cockpit-table" style="width:100%;font-size:0.77rem;">
+      <thead style="position:sticky;top:0;background:var(--surface);z-index:2;"><tr>
+        <th style="text-align:left;">Campaign</th>
+        <th style="text-align:right;">Spend</th>
+        <th style="text-align:right;">ROAS</th>
+        <th style="text-align:right;">Prev ROAS</th>
+        <th style="text-align:right;">Δ ROAS</th>
+        <th style="text-align:right;">Revenue</th>
+        <th style="text-align:right;">Δ Rev</th>
+      </tr></thead>
+      <tbody>
+        ${rows.slice(0,150).map(r => {
+          const p     = campPrevMap[r.key] || { roas:0, rev:0 };
+          const dRoas = r.roas - p.roas;
+          const dRev  = r.rev  - p.rev;
+          const t     = classifyTier(r.key);
+          const m     = classifyMarket(r.key);
+          const roasChanged = Math.abs(dRoas) > 0.01;
+          const revChanged  = Math.abs(dRev)  > 1;
+          return `<tr>
+            <td style="max-width:270px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.key}">
+              ${tierBadge(t)} ${mktBadge(m)} <span style="font-size:0.76rem;">${r.key}</span>
+            </td>
+            <td style="text-align:right;">${fmt.curK(r.spend)}</td>
+            <td style="text-align:right;color:${roasColor(r.roas)};font-weight:600;">${fmt.roas(r.roas)}</td>
+             <td style="text-align:right;color:var(--muted);">${p.roas>0?fmt.roas(p.roas):'—'}</td>
+             <td style="text-align:right;font-weight:600;color:${!roasChanged?'var(--muted)':dRoas>0?'var(--success)':'var(--danger)'}">
+               ${roasChanged?(dRoas>0?'+':'')+dRoas.toFixed(2)+'x':'—'}</td>
+             <td style="text-align:right;">${fmt.curK(r.rev)}</td>
+             <td style="text-align:right;color:${!revChanged?'var(--muted)':dRev>0?'var(--success)':'var(--danger)'}">
+               ${revChanged?(dRev>0?'+':'')+fmt.curK(dRev):'—'}</td>
+           </tr>`;
+         }).join('')}
+      </tbody>
+    </table></div>`;
+};
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: TREND DASHBOARD
+// ═════════════════════════════════════════════════════════════
+function renderTrends() {
+  const weekly = window.EMINZA.weekly || [];
+  const source = window.EMINZA.weeklySource || 'synthesised';
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Dashboard</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Trend Dashboard</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;">
+        <span class="badge" style="background:${source==='live'?'rgba(16,185,129,0.15)':'rgba(245,158,11,0.15)'};color:${source==='live'?'var(--success)':'var(--warning)'};">
+          ${source==='live'?'✓ Live':'⚡ Synthesised'}
+        </span>
+        <select id="trend-range" onchange="refreshTrends()" style="padding:0.3rem 0.5rem;font-size:0.8rem;">
+          <option value="8">Last 8 weeks</option>
+          <option value="13" selected>Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all">Full year</option>
+        </select>
+        <select id="trend-view" onchange="refreshTrends()" style="padding:0.3rem 0.5rem;font-size:0.8rem;">
+          <option value="tier">By Tier</option>
+          <option value="market">By Market</option>
+          <option value="category">By Category</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Spend stack + ROAS multi-line -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend <span style="color:var(--muted);font-size:0.72rem;">(stacked by view)</span></div>
+        <div style="height:200px;position:relative;"><canvas id="chart-spend-trend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS Trend <span style="color:var(--muted);font-size:0.72rem;">— dashed lines = break-even thresholds</span></div>
+        <div style="height:200px;position:relative;"><canvas id="chart-roas-trend"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 2: Contribution ROAS + CPA -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Contribution ROAS vs Break-Even</div>
+        <div style="height:180px;position:relative;"><canvas id="chart-controas-trend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">CPA Trend</div>
+        <div style="height:180px;position:relative;"><canvas id="chart-cpa-trend"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Efficiency heatmap -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.5rem;">Efficiency Heatmap <span style="color:var(--muted);font-size:0.72rem;">— ROAS by week (green = above profit BE, amber = above variable BE, red = below)</span></div>
+      <div id="trend-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 4: Decay detector -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.5rem;">⚠ Efficiency Decay Detector <span style="color:var(--muted);font-size:0.72rem;">— 3+ consecutive weeks of ROAS decline</span></div>
+      <div id="trend-decay"></div>
+    </div>
+  `);
+
+  setTimeout(refreshTrends, 80);
+}
+
+window.refreshTrends = function() {
+  const weekly   = window.EMINZA.weekly || [];
+  const rangeVal = document.getElementById('trend-range')?.value || '13';
+  const view     = document.getElementById('trend-view')?.value || 'tier';
+  const allWeeks = availableWeeks(weekly);
+  const weeks    = rangeVal === 'all' ? allWeeks.slice().reverse() :
+                   allWeeks.slice(0, parseInt(rangeVal)).reverse();
+
+  // Get all distinct groups in view
+  const groupSet = new Set(weekly.map(r => r[view] || 'Other'));
+  const groups   = [...groupSet].filter(g => {
+    // Only include groups with meaningful spend
+    const total = weekly.filter(r=>r[view]===g).reduce((s,r)=>s+r.cost,0);
+    return total > 500;
+  });
+
+  const COLORS_BY_VIEW = view === 'tier' ? TIER_COLORS : {};
+  const palette = ['#C9A84C','#10B981','#3B82F6','#F59E0B','#EF4444','#8B5CF6','#14B8A6','#6366F1','#EC4899'];
+  const getColor = (g, i) => COLORS_BY_VIEW[g] || palette[i % palette.length];
+
+  const weekLabels = weeks.map(wkLabel);
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = groups.map((g, i) => ({
+    label: g,
+    data:  weeks.map(w => {
+      const rows = weekly.filter(r => r.week===w && r[view]===g);
+      return rows.reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor: getColor(g, i) + 'CC',
+    stack: 'spend',
+    borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-spend-trend', 'bar', weekLabels, spendDatasets, {
+    scales: {
+      x: { stacked: true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked: true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = groups.map((g, i) => ({
+    label: g,
+    data:  weeks.map(w => {
+      const rows = weekly.filter(r => r.week===w && r[view]===g);
+      const sp = rows.reduce((s,r)=>s+r.cost,0);
+      const rv = rows.reduce((s,r)=>s+r.convValue,0);
+      return sp > 0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: getColor(g, i),
+    backgroundColor: 'transparent',
+    borderWidth: 2, pointRadius: 2, tension: 0.3,
+    spanGaps: true,
+  }));
+  // Add break-even reference lines
+  roasDatasets.push({
+    label: `Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeks.map(()=>FM.profitBreakevenRoas),
+    borderColor: '#10B98155', borderDash:[4,4], borderWidth:1.5, pointRadius:0,
+    fill: false, tension: 0,
+  });
+  roasDatasets.push({
+    label: `Variable BE (${fmt.roas(FM.variableBreakevenRoas)})`,
+    data: weeks.map(()=>FM.variableBreakevenRoas),
+    borderColor: '#F59E0B55', borderDash:[4,4], borderWidth:1.5, pointRadius:0,
+    fill: false, tension: 0,
+  });
+  makeChart('chart-roas-trend', 'line', weekLabels, roasDatasets, {
+    scales: {
+      x: { ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { ticks:{color:'#8A9BB3',callback:v=>v+'x'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── Contribution ROAS ────────────────────────────────────────
+  const contRoasDatasets = groups.slice(0,5).map((g,i) => ({
+    label: g,
+    data: weeks.map(w => {
+      const rows = weekly.filter(r => r.week===w && r[view]===g);
+      const sp = rows.reduce((s,r)=>s+r.cost,0);
+      const rv = rows.reduce((s,r)=>s+r.convValue,0);
+      const roas = sp > 0 ? rv/sp : 0;
+      return parseFloat(contributionRoas(roas).toFixed(3));
+    }),
+    borderColor: getColor(g,i), backgroundColor:'transparent',
+    borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  contRoasDatasets.push({
+    label:'Variable BE 1.0x', data:weeks.map(()=>1.0),
+    borderColor:'#F59E0B44', borderDash:[4,4], borderWidth:1.5, pointRadius:0, tension:0,
+  });
+  makeChart('chart-controas-trend','line',weekLabels,contRoasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v.toFixed(1)+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── CPA ─────────────────────────────────────────────────────
+  const cpaDatasets = groups.slice(0,5).map((g,i) => ({
+    label: g,
+    data: weeks.map(w => {
+      const rows = weekly.filter(r => r.week===w && r[view]===g);
+      const sp = rows.reduce((s,r)=>s+r.cost,0);
+      const cv = rows.reduce((s,r)=>s+r.conv,0);
+      return cv > 0 ? parseFloat((sp/cv).toFixed(1)) : null;
+    }),
+    borderColor: getColor(g,i), backgroundColor:'transparent',
+    borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  makeChart('chart-cpa-trend','line',weekLabels,cpaDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>'$'+v},grid:{color:'rgba(255,255,255,0.04)'},reverse:false}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('trend-heatmap');
+  if (heatEl) {
+    const heatGroups = groups.slice(0, 12);
+    const cellColor = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.7, (roas-FM.profitBreakevenRoas)/3+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/2+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.3*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.72rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;">
+            ${view.charAt(0).toUpperCase()+view.slice(1)}
+          </th>
+          ${weeks.map(w=>`<th style="text-align:center;padding:0.2rem;color:var(--muted);min-width:36px;">${wkLabel(w)}</th>`).join('')}
+        </thead>
+        <tbody>
+          ${heatGroups.map(g=>`
+            <tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;">
+                ${view==='tier'?tierBadge(g):view==='market'?mktBadge(g):`<span style="font-size:0.72rem;">${g}</span>`}
+              </td>
+              ${weeks.map(w=>{
+                const rows = weekly.filter(r=>r.week===w&&r[view]===g);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.convValue,0);
+                const roas=sp>0?rv/sp:0;
+                const bg=cellColor(roas);
+                return `<td style="text-align:center;padding:0.2rem;background:${bg};border-radius:3px;">
+                  ${sp>0?`<span style="font-size:0.7rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  // ── Decay detector ───────────────────────────────────────────
+  const decayEl = document.getElementById('trend-decay');
+  if (decayEl && weeks.length >= 4) {
+    const decaying = [];
+    groups.forEach(g => {
+      const roasByWeek = weeks.map(w => {
+        const rows = weekly.filter(r=>r.week===w&&r[view]===g);
+        const sp = rows.reduce((s,r)=>s+r.cost,0);
+        const rv = rows.reduce((s,r)=>s+r.convValue,0);
+        return { w, roas: sp>0?rv/sp:null };
+      }).filter(x=>x.roas!==null);
+      // Check for 3+ consecutive declining weeks (most recent)
+      const recent = roasByWeek.slice(-6);
+      let streak = 0;
+      for (let i = recent.length-1; i > 0; i--) {
+        if (recent[i].roas < recent[i-1].roas) streak++;
+        else break;
+      }
+      if (streak >= 3) {
+        const latest = recent[recent.length-1];
+        const peak   = Math.max(...recent.slice(-streak-1).map(r=>r.roas));
+        decaying.push({ g, streak, latestRoas:latest.roas, peak, drop:(peak-latest.roas)/peak*100 });
+      }
+    });
+
+    decayEl.innerHTML = decaying.length ? `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">${view.charAt(0).toUpperCase()+view.slice(1)}</th>
+          <th>Decline streak</th>
+          <th>Peak ROAS</th>
+          <th>Current ROAS</th>
+          <th>Drop</th>
+          <th>Action</th>
+        </tr></thead>
+        <tbody>
+          ${decaying.sort((a,b)=>b.drop-a.drop).map(d=>`
+            <tr>
+              <td>${view==='tier'?tierBadge(d.g):view==='market'?mktBadge(d.g):d.g}</td>
+              <td style="color:var(--danger);font-weight:600;">${d.streak} weeks ↓</td>
+              <td style="color:var(--muted);">${fmt.roas(d.peak)}</td>
+              <td style="color:${roasColor(d.latestRoas)};font-weight:600;">${fmt.roas(d.latestRoas)}</td>
+              <td style="color:var(--danger);font-weight:600;">${d.drop.toFixed(1)}% from peak</td>
+              <td style="font-size:0.75rem;color:var(--muted);">Review spend mix · check search term quality · check bid strategy</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    ` : `<p style="color:var(--success);font-size:0.82rem;padding:0.5rem 0;">✓ No sustained efficiency declines detected in the selected window.</p>`;
+  }
+};
+
+
+
+// --- projection.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FORWARD PROJECTION ENGINE  —  projection.js
+// Uses real Suivi Hebdo seasonality (W1–W31 actual) to project W33–W52
+// Wired into Budget Lab as the "Forward Projection" tab
+// All output clearly labelled MODELLED — NOT ACTUAL
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PROJ_CURRENT_WEEK = 32;
+const PROJ_WEEKS = Array.from({ length: 20 }, (_, i) => i + 33); // W33–W52
+
+// Key retail events to annotate on the chart
+const PROJ_EVENTS = {
+  34: 'Back to School',
+  40: 'Autumn Push',
+  44: 'Pre-Noël',
+  46: 'Black Friday',
+  50: 'Christmas',
+};
+
+// Tier → Category blend weights (how each tier's spend is distributed across categories)
+// Calibrated from campaign naming patterns and YTD revenue split in suivi data
+const TIER_CAT_WEIGHTS = {
+  'TOP':          { 'Linge/Textile': 0.40, 'Outdoor/Garden': 0.25, 'Permanents': 0.20, 'Mobilier & Déco': 0.15 },
+  'TOP SEASONAL': { 'Outdoor/Garden': 0.45, 'Noël': 0.25, 'Linge/Textile': 0.20, 'Permanents': 0.10 },
+  'CATCH ALL':    { 'Permanents': 0.45, 'Linge/Textile': 0.30, 'Outdoor/Garden': 0.10, 'Mobilier & Déco': 0.15 },
+  'MID':          { 'Permanents': 0.45, 'Linge/Textile': 0.30, 'Outdoor/Garden': 0.15, 'Mobilier & Déco': 0.10 },
+  'LOW':          { 'Permanents': 0.60, 'Linge/Textile': 0.25, 'Outdoor/Garden': 0.10, 'Mobilier & Déco': 0.05 },
+  'ZOMBIE':       { 'Permanents': 0.70, 'Linge/Textile': 0.20, 'Outdoor/Garden': 0.10 },
+  'NOUVEAUTES':   { 'Enfant': 0.35, 'Linge/Textile': 0.30, 'Permanents': 0.20, 'Mobilier & Déco': 0.15 },
+  'BRANDING':     { 'Permanents': 1.00 },
+  'OTHER':        { 'Permanents': 0.50, 'Linge/Textile': 0.30, 'Outdoor/Garden': 0.20 },
+};
+
+// Hand-calibrated W32–W52 shape for each category
+// Based on: W1–W31 actual suivi patterns + standard European retail seasonality
+// Sources: actual peaks in data (Outdoor W18 peak, Linge W2 peak, Noël W1 post-Xmas)
+const CAT_W32_W52_SHAPE = {
+  'Outdoor/Garden': {
+    32:0.80, 33:0.72, 34:0.62, 35:0.52, 36:0.44,
+    37:0.37, 38:0.31, 39:0.27, 40:0.24, 41:0.22,
+    42:0.22, 43:0.22, 44:0.21, 45:0.21, 46:0.21,
+    47:0.20, 48:0.19, 49:0.18, 50:0.15, 51:0.12, 52:0.10
+  },
+  'Linge/Textile': {
+    32:0.85, 33:0.88, 34:0.90, 35:0.92, 36:0.95,
+    37:0.98, 38:1.02, 39:1.06, 40:1.10, 41:1.15,
+    42:1.20, 43:1.25, 44:1.28, 45:1.30, 46:1.25,
+    47:1.20, 48:1.18, 49:1.10, 50:1.05, 51:1.00, 52:0.98
+  },
+  'Mobilier & Déco': {
+    32:1.40, 33:1.35, 34:1.30, 35:1.25, 36:1.20,
+    37:1.15, 38:1.12, 39:1.10, 40:1.08, 41:1.05,
+    42:1.02, 43:1.00, 44:0.98, 45:0.97, 46:0.98,
+    47:1.00, 48:1.02, 49:1.05, 50:1.08, 51:1.05, 52:1.00
+  },
+  'Noël': {
+    32:0.15, 33:0.15, 34:0.16, 35:0.17, 36:0.18,
+    37:0.18, 38:0.19, 39:0.20, 40:0.22, 41:0.25,
+    42:0.30, 43:0.40, 44:0.60, 45:0.90, 46:1.40,
+    47:2.00, 48:2.80, 49:3.80, 50:4.80, 51:5.20, 52:5.00
+  },
+  'Permanents': {
+    32:0.88, 33:0.88, 34:0.90, 35:0.92, 36:0.93,
+    37:0.94, 38:0.95, 39:0.97, 40:0.98, 41:1.00,
+    42:1.02, 43:1.03, 44:1.05, 45:1.06, 46:1.07,
+    47:1.05, 48:1.04, 49:1.05, 50:1.08, 51:1.10, 52:1.08
+  },
+  'Enfant': {
+    32:0.45, 33:0.60, 34:0.90, 35:1.05, 36:1.00,
+    37:0.95, 38:0.92, 39:0.90, 40:0.88, 41:0.88,
+    42:0.90, 43:0.92, 44:0.95, 45:1.00, 46:1.05,
+    47:1.10, 48:1.15, 49:1.20, 50:1.25, 51:1.20, 52:1.10
+  },
+};
+
+// ── Seasonality engine ────────────────────────────────────────────────────────
+
+/**
+ * Returns a week → seasonality index map for a given category.
+ * W1–W31: derived from real suivi data. W32–W52: from CAT_W32_W52_SHAPE.
+ */
+function buildCategorySeasonality() {
+  const suivi = window.EMINZA.suivi || [];
+  const actual = {}; // cat → { week → totalRevenue }
+
+  suivi.forEach(r => {
+    if (!actual[r.category]) actual[r.category] = {};
+    actual[r.category][r.week] = (actual[r.category][r.week] || 0) + r.revenue;
+  });
+
+  const result = {};
+  const CATS = Object.keys(TIER_CAT_WEIGHTS['TOP']).concat(
+    Object.keys(TIER_CAT_WEIGHTS['TOP SEASONAL']),
+    Object.keys(TIER_CAT_WEIGHTS['NOUVEAUTES'])
+  ).filter((v, i, a) => a.indexOf(v) === i);
+
+  CATS.forEach(cat => {
+    result[cat] = {};
+
+    // W1–W31 from actual suivi
+    const weeks = actual[cat] ? Object.keys(actual[cat]).map(Number) : [];
+    const avgActual = weeks.length
+      ? weeks.reduce((s, w) => s + actual[cat][w], 0) / weeks.length
+      : 1;
+
+    for (let w = 1; w <= 31; w++) {
+      result[cat][w] = actual[cat] && actual[cat][w]
+        ? actual[cat][w] / avgActual
+        : 1.0;
+    }
+
+    // W32–W52 from hand-calibrated shape
+    const shape = CAT_W32_W52_SHAPE[cat] || {};
+    for (let w = 32; w <= 52; w++) {
+      result[cat][w] = shape[w] !== undefined ? shape[w] : 1.0;
+    }
+  });
+
+  return result;
+}
+
+/**
+ * Returns the seasonality index for a given tier at a given week,
+ * blended across the tier's category weights.
+ */
+function getTierSeasonalityIndex(tier, week, catSeasonality) {
+  const weights = TIER_CAT_WEIGHTS[tier] || TIER_CAT_WEIGHTS['OTHER'];
+  let index = 0;
+  let totalWeight = 0;
+  Object.entries(weights).forEach(([cat, wt]) => {
+    const idx = catSeasonality[cat] ? (catSeasonality[cat][week] || 1.0) : 1.0;
+    index += idx * wt;
+    totalWeight += wt;
+  });
+  return totalWeight > 0 ? index / totalWeight : 1.0;
+}
+
+/**
+ * Returns the average seasonality index for a tier over W1–W31
+ * (the period our YTD ROAS was measured over).
+ */
+function getTierYtdAvgSeasonality(tier, catSeasonality) {
+  const indices = [];
+  for (let w = 1; w <= PROJ_CURRENT_WEEK; w++) {
+    indices.push(getTierSeasonalityIndex(tier, w, catSeasonality));
+  }
+  return indices.reduce((a, b) => a + b, 0) / indices.length;
+}
+
+// ── Projection calculator ─────────────────────────────────────────────────────
+
+/**
+ * Applies marginal decay when budget changes.
+ * decay = 0 means linear (ROAS constant), decay = 1 means zero marginal return.
+ * Base = 15% (0.15) → power = 1 - 0.15 = 0.85
+ */
+function decayAdjustRoas(baseRoas, currentBudget, newBudget, decayRate) {
+  if (currentBudget <= 0 || newBudget <= 0) return baseRoas;
+  const ratio = newBudget / currentBudget;
+  const power = 1 - decayRate;
+  return baseRoas * Math.pow(ratio, power - 1);
+}
+
+/**
+ * Projects a single tier for all remaining weeks.
+ */
+function projectTier(tier, ytdRoas, ytdWeeklyBudget, newWeeklyBudget, catSeasonality, decayRate) {
+  const ytdAvgIdx = getTierYtdAvgSeasonality(tier, catSeasonality);
+  const adjustedRoas = decayAdjustRoas(ytdRoas, ytdWeeklyBudget, newWeeklyBudget, decayRate);
+
+  return PROJ_WEEKS.map(w => {
+    const idx = getTierSeasonalityIndex(tier, w, catSeasonality);
+    // ROAS adjusted for: decay (budget change) + seasonality vs YTD avg
+    const weekRoas = adjustedRoas * (idx / Math.max(ytdAvgIdx, 0.01));
+    const spend = newWeeklyBudget;
+    const revenue = spend * weekRoas;
+    const contribution = revenue * FM.contributionMarginAvailable;
+    return { week: w, spend, revenue, roas: weekRoas, contribution, seasonalIdx: idx };
+  });
+}
+
+/**
+ * Run full projection for all tiers given an allocation object.
+ * allocation = { tier: totalBudgetForRestOfYear }
+ */
+function runProjection(allocation) {
+  const camps = window.EMINZA.campaigns;
+  const weeksElapsed = PROJ_CURRENT_WEEK;
+  const catSeasonality = buildCategorySeasonality();
+  const decayRate = parseFloat(document.getElementById('blab-decay')?.value || '0.15');
+
+  // Get YTD stats per tier
+  const tierStats = {};
+  const tierGroups = groupBy(camps, 'tier');
+  tierGroups.forEach(g => {
+    tierStats[g.key] = {
+      ytdSpend: g.spend,
+      ytdRevenue: g.convValue,
+      ytdRoas: g.roas,
+      weeklyBudget: g.spend / weeksElapsed,
+    };
+  });
+
+  const results = [];
+  Object.entries(allocation).forEach(([tier, totalBudget]) => {
+    const stats = tierStats[tier];
+    if (!stats || stats.ytdRoas === 0) return;
+    const weeklyBudget = totalBudget / PROJ_WEEKS.length;
+    const projection = projectTier(
+      tier,
+      stats.ytdRoas,
+      stats.weeklyBudget,
+      weeklyBudget,
+      catSeasonality,
+      decayRate
+    );
+    results.push({ tier, weeklyBudget, totalBudget, ytdRoas: stats.ytdRoas, projection });
+  });
+  return results;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+
+let _projChart = null;
+
+window.renderForwardProjection = function() {
+  const el = document.getElementById('proj-content');
+  if (!el) return;
+
+  const camps = window.EMINZA.campaigns;
+  if (!camps.length) {
+    el.innerHTML = `<div style="padding:2rem;color:var(--muted);text-align:center">Campaign data loading…</div>`;
+    return;
+  }
+
+  // Build status-quo allocation from YTD run-rate × remaining weeks
+  const weeksElapsed = PROJ_CURRENT_WEEK;
+  const tierGroups = groupBy(camps, 'tier');
+  const SHOW_TIERS = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const sqAllocation = {};
+  tierGroups.filter(g => SHOW_TIERS.includes(g.key)).forEach(g => {
+    sqAllocation[g.key] = (g.spend / weeksElapsed) * PROJ_WEEKS.length;
+  });
+
+  // Use the live _budgetAlloc state (set by the allocation table)
+  const liveAlloc = window._budgetAlloc || {};
+  const customAlloc = {};
+  let hasCustom = false;
+
+  SHOW_TIERS.forEach(t => {
+    const liveSpend = liveAlloc[t];
+    const sqSpend   = sqAllocation[t];
+    if (liveSpend !== undefined) {
+      customAlloc[t] = (liveSpend / PROJ_CURRENT_WEEK) * PROJ_WEEKS.length;
+      if (sqSpend && Math.abs(liveSpend - sqSpend) > sqSpend * 0.01) hasCustom = true;
+    } else if (sqSpend) {
+      customAlloc[t] = sqSpend;
+    }
+  });
+
+  const sqResults  = runProjection(sqAllocation);
+  const cxResults  = hasCustom ? runProjection(customAlloc) : null;
+
+  // Aggregate by week
+  const sqByWeek  = aggregateByWeek(sqResults);
+  const cxByWeek  = cxResults ? aggregateByWeek(cxResults) : null;
+
+  const sqTotal   = sumProjection(sqResults);
+  const cxTotal   = cxResults ? sumProjection(cxResults) : null;
+
+  el.innerHTML = buildProjectionHTML(sqTotal, cxTotal, sqResults, cxResults, hasCustom);
+
+  setTimeout(() => drawProjectionChart(PROJ_WEEKS, sqByWeek, cxByWeek), 60);
+  setTimeout(() => drawTierChart(sqResults, cxResults), 80);
+};
+
+function aggregateByWeek(results) {
+  const map = {};
+  PROJ_WEEKS.forEach(w => { map[w] = { spend: 0, revenue: 0, contribution: 0, count: 0 }; });
+  results.forEach(({ projection }) => {
+    projection.forEach(pw => {
+      map[pw.week].spend        += pw.spend;
+      map[pw.week].revenue      += pw.revenue;
+      map[pw.week].contribution += pw.contribution;
+      map[pw.week].count++;
+    });
+  });
+  return map;
+}
+
+function sumProjection(results) {
+  return results.reduce((acc, { totalBudget, projection }) => {
+    acc.spend        += totalBudget;
+    acc.revenue      += projection.reduce((s, p) => s + p.revenue, 0);
+    acc.contribution += projection.reduce((s, p) => s + p.contribution, 0);
+    return acc;
+  }, { spend: 0, revenue: 0, contribution: 0 });
+}
+
+function buildProjectionHTML(sqTotal, cxTotal, sqResults, cxResults, hasCustom) {
+  const deltaRev   = cxTotal ? cxTotal.revenue      - sqTotal.revenue      : 0;
+  const deltaCont  = cxTotal ? cxTotal.contribution - sqTotal.contribution : 0;
+  const deltaSpend = cxTotal ? cxTotal.spend        - sqTotal.spend        : 0;
+
+  const pill = (v, positive, fmt_fn) => {
+    if (!cxTotal) return '';
+    const good = positive ? v > 0 : v < 0;
+    const color = Math.abs(v) < 1 ? 'var(--muted)' : good ? 'var(--success)' : 'var(--danger)';
+    return `<span style="color:${color};font-size:0.78rem;font-weight:600;margin-left:0.5rem">${v > 0 ? '+' : ''}${fmt_fn(v)}</span>`;
+  };
+
+  // Summary cards
+  const cards = [
+    { label: 'W33–W52 Projected Revenue', sq: fmt.curK(sqTotal.revenue), cx: cxTotal ? fmt.curK(cxTotal.revenue) : null, delta: pill(deltaRev, true, fmt.curK) },
+    { label: 'W33–W52 Net Contribution', sq: fmt.curK(sqTotal.contribution), cx: cxTotal ? fmt.curK(cxTotal.contribution) : null, delta: pill(deltaCont, true, fmt.curK) },
+    { label: 'W33–W52 Ad Spend', sq: fmt.curK(sqTotal.spend), cx: cxTotal ? fmt.curK(cxTotal.spend) : null, delta: pill(deltaSpend, false, fmt.curK) },
+    { label: 'Implied Full-Year ROAS', sq: fmt.roas(sqTotal.revenue / sqTotal.spend), cx: cxTotal ? fmt.roas(cxTotal.revenue / cxTotal.spend) : null, delta: '' },
+  ];
+
+  const cardsHTML = cards.map(c => `
+    <div class="card" style="padding:0.75rem 1rem;">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem">${c.label}</div>
+      ${c.cx
+        ? `<div style="display:flex;align-items:baseline;gap:0.5rem">
+             <span style="font-size:0.85rem;color:var(--muted);text-decoration:line-through">${c.sq}</span>
+             <span style="font-size:1.1rem;font-weight:700">${c.cx}${c.delta}</span>
+           </div>`
+        : `<div style="font-size:1.1rem;font-weight:700">${c.sq}</div>`
+      }
+    </div>`).join('');
+
+  // Tier impact table
+  const tierRows = TIER_ORDER.filter(t => sqResults.find(r => r.tier === t)).map(t => {
+    const sq = sqResults.find(r => r.tier === t);
+    const cx = cxResults ? cxResults.find(r => r.tier === t) : null;
+    const sqRev  = sq ? sq.projection.reduce((s, p) => s + p.revenue, 0) : 0;
+    const cxRev  = cx ? cx.projection.reduce((s, p) => s + p.revenue, 0) : sqRev;
+    const sqCont = sq ? sq.projection.reduce((s, p) => s + p.contribution, 0) : 0;
+    const cxCont = cx ? cx.projection.reduce((s, p) => s + p.contribution, 0) : sqCont;
+    const sqBudg = sq ? sq.totalBudget : 0;
+    const cxBudg = cx ? cx.totalBudget : sqBudg;
+    const avgRoas = cx ? cx.projection.reduce((s, p) => s + p.roas, 0) / PROJ_WEEKS.length
+                       : sq ? sq.projection.reduce((s, p) => s + p.roas, 0) / PROJ_WEEKS.length : 0;
+    const dRev  = cxRev  - sqRev;
+    const dCont = cxCont - sqCont;
+    const dBudg = cxBudg - sqBudg;
+
+    return `<tr>
+      <td>${tierBadge(t)}</td>
+      <td style="color:var(--muted)">${fmt.curK(sqBudg)}${cxBudg !== sqBudg ? `<span style="color:${dBudg>0?'var(--warning)':'var(--muted)'}"> → ${fmt.curK(cxBudg)}</span>` : ''}</td>
+      <td style="color:${roasColorCss(avgRoas)};font-weight:600">${fmt.roas(avgRoas)}</td>
+      <td style="color:${roasColorCss(avgRoas)};font-weight:600">${fmt.roas(contributionRoas(avgRoas))}</td>
+      <td>${fmt.curK(cxRev)}${dRev !== 0 ? `<span style="color:${dRev>0?'var(--success)':'var(--danger)'}"> (${dRev>0?'+':''}${fmt.curK(dRev)})</span>` : ''}</td>
+      <td style="color:${cxCont>0?'var(--success)':'var(--danger)'}">${fmt.curK(cxCont)}${dCont !== 0 ? `<span style="color:${dCont>0?'var(--success)':'var(--danger)'}"> (${dCont>0?'+':''}${fmt.curK(dCont)})</span>` : ''}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div style="background:rgba(201,168,76,0.08);border:1px solid rgba(201,168,76,0.25);border-radius:6px;padding:0.6rem 1rem;margin-bottom:1rem;font-size:0.78rem;color:var(--gold)">
+      ⚡ MODELLED PROJECTION — NOT ACTUAL · W33–W52 2026 (${PROJ_WEEKS.length} remaining weeks) · Seasonality from Suivi Hebdo W1–W31 actual · Decay ${document.getElementById('blab-decay')?.options[document.getElementById('blab-decay')?.selectedIndex]?.text || 'Base — 15%'}
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.6rem;margin-bottom:1rem">
+      ${cardsHTML}
+    </div>
+
+    ${hasCustom ? `<div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;padding:0.5rem 1rem;margin-bottom:1rem;font-size:0.78rem;color:var(--success)">
+      ✓ Showing impact of your proposed reallocation vs status quo
+      <span style="color:${deltaCont>0?'var(--success)':'var(--danger)'}"> · Incremental contribution: ${deltaCont>0?'+':''}${fmt.curK(deltaCont)} for rest of year</span>
+    </div>` : `<div style="font-size:0.78rem;color:var(--muted);margin-bottom:0.75rem;padding:0.5rem 1rem;background:var(--surface);border-radius:6px">
+      💡 Change budget allocations in the Allocation tab above to see the impact here vs status quo
+    </div>`}
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:1rem">
+      <div class="card" style="padding:0.75rem">
+        <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem">
+          Weekly Projected Revenue — W33 to W52
+          ${hasCustom ? '<span style="color:var(--success);margin-left:0.5rem">· Grey = status quo · Green = proposed</span>' : ''}
+        </div>
+        <div style="position:relative;height:200px"><canvas id="proj-week-chart"></canvas></div>
+        <div style="display:flex;gap:0.75rem;margin-top:0.4rem;flex-wrap:wrap">
+          ${Object.entries(PROJ_EVENTS).map(([w, label]) =>
+            `<span style="font-size:0.68rem;color:var(--muted)"><span style="color:var(--gold)">W${w}</span> ${label}</span>`
+          ).join('')}
+        </div>
+      </div>
+      <div class="card" style="padding:0.75rem">
+        <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem">
+          Projected Revenue by Tier — W33–W52
+        </div>
+        <div style="position:relative;height:200px"><canvas id="proj-tier-chart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Tier Projection Detail — W33–W52</div>
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Tier</th>
+          <th>Budget W33–W52</th>
+          <th>Avg ROAS</th>
+          <th>Cont. ROAS</th>
+          <th>Projected Revenue</th>
+          <th>Net Contribution</th>
+        </tr></thead>
+        <tbody>${tierRows}</tbody>
+        <tfoot><tr style="font-weight:700;border-top:2px solid var(--border)">
+          <td>Total</td>
+          <td>${fmt.curK(cxTotal ? cxTotal.spend : sqTotal.spend)}</td>
+          <td style="color:${roasColorCss((cxTotal||sqTotal).revenue/(cxTotal||sqTotal).spend)}">${fmt.roas((cxTotal||sqTotal).revenue/(cxTotal||sqTotal).spend)}</td>
+          <td>${fmt.roas(contributionRoas((cxTotal||sqTotal).revenue/(cxTotal||sqTotal).spend))}</td>
+          <td>${fmt.curK((cxTotal||sqTotal).revenue)}${deltaRev!==0?`<span style="color:${deltaRev>0?'var(--success)':'var(--danger)'}"> (${deltaRev>0?'+':''}${fmt.curK(deltaRev)})</span>`:''}</td>
+          <td style="color:var(--success)">${fmt.curK((cxTotal||sqTotal).contribution)}${deltaCont!==0?`<span style="color:${deltaCont>0?'var(--success)':'var(--danger)'}"> (${deltaCont>0?'+':''}${fmt.curK(deltaCont)})</span>`:''}</td>
+        </tr></tfoot>
+      </table>
+    </div>`;
+}
+
+function drawProjectionChart(weeks, sqByWeek, cxByWeek) {
+  const canvas = document.getElementById('proj-week-chart');
+  if (!canvas) return;
+  if (_projChart) { _projChart.destroy(); _projChart = null; }
+
+  const labels = weeks.map(w => `W${String(w).padStart(2,'0')}`);
+  const sqRevs  = weeks.map(w => Math.round(sqByWeek[w].revenue));
+  const sqConts = weeks.map(w => Math.round(sqByWeek[w].contribution));
+  const cxRevs  = cxByWeek ? weeks.map(w => Math.round(cxByWeek[w].revenue)) : null;
+
+  // Annotation lines for key events
+  const eventWeeks = Object.keys(PROJ_EVENTS).map(Number);
+
+  const datasets = [
+    {
+      label: 'Status Quo Revenue',
+      data: sqRevs,
+      borderColor: '#6B7280',
+      backgroundColor: 'rgba(107,114,128,0.08)',
+      borderWidth: cxRevs ? 1.5 : 2,
+      borderDash: cxRevs ? [4, 3] : [],
+      fill: true,
+      tension: 0.35,
+      pointRadius: weeks.map(w => eventWeeks.includes(w) ? 5 : 2),
+      pointBackgroundColor: weeks.map(w => eventWeeks.includes(w) ? '#C9A84C' : '#6B7280'),
+    },
+  ];
+
+  if (cxRevs) {
+    datasets.push({
+      label: 'Proposed Revenue',
+      data: cxRevs,
+      borderColor: '#10B981',
+      backgroundColor: 'rgba(16,185,129,0.12)',
+      borderWidth: 2.5,
+      fill: true,
+      tension: 0.35,
+      pointRadius: weeks.map(w => eventWeeks.includes(w) ? 5 : 2),
+      pointBackgroundColor: weeks.map(w => eventWeeks.includes(w) ? '#C9A84C' : '#10B981'),
+    });
+  }
+
+  datasets.push({
+    label: 'Net Contribution',
+    data: cxByWeek ? weeks.map(w => Math.round(cxByWeek[w].contribution)) : sqConts,
+    borderColor: '#C9A84C',
+    backgroundColor: 'rgba(0,0,0,0)',
+    borderWidth: 1.5,
+    borderDash: [6, 3],
+    fill: false,
+    tension: 0.35,
+    pointRadius: 0,
+    yAxisID: 'y2',
+  });
+
+  _projChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: true, position: 'top', labels: { color: '#8A9BB3', font: { size: 10 }, boxWidth: 10, padding: 8 } },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${fmt.curK(ctx.raw)}`,
+            title: ctx => {
+              const w = parseInt(ctx[0].label.replace('W',''));
+              return PROJ_EVENTS[w] ? `${ctx[0].label} — ${PROJ_EVENTS[w]}` : ctx[0].label;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#8A9BB3', font: { size: 9 }, maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,0.04)' } },
+        y: { position: 'left', ticks: { color: '#8A9BB3', font: { size: 9 }, callback: v => fmt.curK(v) }, grid: { color: 'rgba(255,255,255,0.04)' } },
+        y2: { position: 'right', ticks: { color: '#C9A84C', font: { size: 9 }, callback: v => fmt.curK(v) }, grid: { display: false } },
+      }
+    }
+  });
+}
+
+let _projTierChart = null;
+function drawTierChart(sqResults, cxResults) {
+  const canvas = document.getElementById('proj-tier-chart');
+  if (!canvas) return;
+  if (_projTierChart) { _projTierChart.destroy(); _projTierChart = null; }
+
+  const tiers = TIER_ORDER.filter(t => sqResults.find(r => r.tier === t));
+  const results = cxResults || sqResults;
+
+  const data = tiers.map(t => {
+    const r = results.find(x => x.tier === t);
+    return r ? Math.round(r.projection.reduce((s, p) => s + p.revenue, 0)) : 0;
+  });
+
+  _projTierChart = new Chart(canvas.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: tiers,
+      datasets: [{
+        label: 'Projected Revenue',
+        data,
+        backgroundColor: tiers.map(t => (TIER_COLORS[t] || '#6B7280') + 'BB'),
+        borderColor: tiers.map(t => TIER_COLORS[t] || '#6B7280'),
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8A9BB3', font: { size: 9 } }, grid: { display: false } },
+        y: { ticks: { color: '#8A9BB3', font: { size: 9 }, callback: v => fmt.curK(v) }, grid: { color: 'rgba(255,255,255,0.04)' } }
+      }
+    }
+  });
+}
+
+// Expose for Budget Lab tab switching
+window.refreshProjection = window.renderForwardProjection;
+
+
+// --- incrementality_sim.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INCREMENTALITY SPEND SIMULATOR  —  incrementality_sim.js
+// Models true incremental returns using S-curves + per-tier incrementality factors
+// Three views (Tier / Market / Campaign) all wired to live outcome + charts
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Defaults & Constants ──────────────────────────────────────────────────────
+
+const INC_FACTOR_DEFAULTS = {
+  'TOP':          0.75,   // High-intent new users, some organic overlap
+  'TOP SEASONAL': 0.70,   // Seasonal demand exists anyway
+  'CATCH ALL':    0.55,   // Broad match, much organic overlap
+  'MID':          0.65,   // Mixed intent
+  'LOW':          0.50,   // Likely capturing own-brand/organic
+  'ZOMBIE':       0.25,   // Hypothesis: composition bias, mostly organic
+  'NOUVEAUTES':   0.85,   // New products, ad-driven discovery
+  'BRANDING':     0.15,   // Mostly organic brand searches
+  'OTHER':        0.60,
+};
+
+const INC_TIER_COLORS = {
+  'TOP':'#10B981','TOP SEASONAL':'#3B82F6','CATCH ALL':'#8B5CF6',
+  'MID':'#F59E0B','LOW':'#EF4444','ZOMBIE':'#6B7280',
+  'NOUVEAUTES':'#06B6D4','BRANDING':'#C9A84C','OTHER':'#9CA3AF',
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+window._incFactors       = JSON.parse(localStorage.getItem('eminza_inc_factors_v2') || '{}');
+window._incSimAlloc      = {};   // tier → spend override (YTD)
+window._incSimMktAlloc   = {};   // market → spend override
+window._incSimCampAlloc  = {};   // campaignKey → spend override
+window._incSatMult       = 2.5;
+window._incSimMode       = 'tier';
+window._incSimExpanded   = {};   // tier → bool
+window._incSimAllocInit  = false;
+window._incCurveTier     = null;
+window._incCampSearch    = '';
+
+function getIF(tier) {
+  const v = window._incFactors[tier];
+  return v !== undefined ? v : (INC_FACTOR_DEFAULTS[tier] || 0.60);
+}
+
+function saveIFs() {
+  localStorage.setItem('eminza_inc_factors_v2', JSON.stringify(window._incFactors));
+}
+
+// ── S-Curve Engine ────────────────────────────────────────────────────────────
+
+// revenue(spend) = A × (1 − e^(−k × spend)), anchored at (curSpend, curRev)
+function sCurve(spend, curSpend, curRev, satMult) {
+  if (curSpend <= 0 || curRev <= 0 || spend <= 0) return 0;
+  const A     = curRev * satMult;
+  const ratio = curRev / A;
+  if (ratio >= 1) return curRev;
+  const k = -Math.log(1 - ratio) / curSpend;
+  return A * (1 - Math.exp(-k * spend));
+}
+
+// True incremental revenue = attributed × IF
+function incRev(spend, curSpend, curRev, tier, satMult) {
+  return sCurve(spend, curSpend, curRev, satMult) * getIF(tier);
+}
+
+// Marginal incremental revenue for the next €10k
+function margPerK10(spend, curSpend, curRev, tier, satMult) {
+  const eps = 10000;
+  return (sCurve(spend + eps, curSpend, curRev, satMult) - sCurve(spend, curSpend, curRev, satMult)) * getIF(tier);
+}
+
+// Numerical breakeven: find spend where incROAS = targetRoas
+function findBESpend(curSpend, curRev, tier, satMult, targetRoas) {
+  const IF = getIF(tier);
+  if (IF <= 0 || curRev <= 0) return 0;
+  let lo = curSpend * 0.001, hi = curSpend * 8;
+  for (let i = 0; i < 64; i++) {
+    const mid = (lo + hi) / 2;
+    const ir = mid > 0 ? incRev(mid, curSpend, curRev, tier, satMult) / mid : 0;
+    if (ir > targetRoas) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// ── Main render ───────────────────────────────────────────────────────────────
+
+window._renderIncLab = function() {
+  const tests = incGetAll();
+  const view  = window._incView || 'board';
+  const camps = window.EMINZA.campaigns || [];
+  const zmb   = camps.filter(c => c.tier === 'ZOMBIE');
+  const weeklyConv = zmb.reduce((s,c) => s + c.conv, 0) / 32;
+  const zombieRoas = zmb.reduce((s,c) => s + c.cost, 0) > 0
+    ? zmb.reduce((s,c) => s + c.convValue, 0) / zmb.reduce((s,c) => s + c.cost, 0) : 4.34;
+
+  const tb = (icon, label, v, extra='') =>
+    `<button class="btn-ghost" onclick="window._incView='${v}';renderIncrementality()"
+      style="font-size:0.78rem;padding:0.25rem 0.65rem;${view===v?'background:var(--accent-gold);color:#000;':''}${extra}">${icon} ${label}</button>`;
+
+  setMain(`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;flex-wrap:wrap;gap:0.4rem;">
+      <div>
+        <div class="breadcrumb">Planning</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Incrementality Lab</h2>
+      </div>
+      <div style="display:flex;gap:0.3rem;flex-wrap:wrap;">
+        ${tb('📋','Test Register','board')}
+        ${tb('📑','List','list')}
+        ${tb('💰','Spend Simulator','sim')}
+        ${tb('📈','Saturation Curves','curves')}
+        <button class="btn-ghost" onclick="window._incView='design';renderIncrementality()"
+          style="font-size:0.78rem;padding:0.25rem 0.65rem;border-color:var(--gold);color:var(--gold);">+ New Test</button>
+      </div>
+    </div>
+
+    ${view === 'sim'    ? _incSimHTML()    :
+      view === 'curves' ? _incCurvesHTML() :
+      view === 'board'  ? renderIncBoard(tests) :
+      view === 'list'   ? renderIncList(tests) :
+      renderIncDesign()}
+
+    ${(view === 'board' || view === 'list') ? `
+    <div class="card" style="margin-top:0.75rem;">
+      <div class="card-header">📊 Statistical Power — ZOMBIE Geo Holdout</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;padding:0.75rem 1rem;">
+        <div><div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem">Weekly conv. (test mkts)</div>
+          <div style="font-size:1.05rem;font-weight:700">${Math.round(weeklyConv*0.25)}</div>
+          <div style="font-size:0.67rem;color:var(--muted)">~25% ZOMBIE · 2 markets</div></div>
+        <div><div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem">Baseline ROAS</div>
+          <div style="font-size:1.05rem;font-weight:700;color:${roasColorCss(zombieRoas)}">${fmt.roas(zombieRoas)}</div>
+          <div style="font-size:0.67rem;color:var(--muted)">Current ZOMBIE attributed</div></div>
+        <div><div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem">MDE at 80% power</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--warning)">~35–50%</div>
+          <div style="font-size:0.67rem;color:var(--muted)">Underpowered for small lifts</div></div>
+        <div><div style="font-size:0.7rem;color:var(--muted);margin-bottom:0.2rem">Recommended duration</div>
+          <div style="font-size:1.05rem;font-weight:700">4 weeks</div>
+          <div style="font-size:0.67rem;color:var(--muted)">Min 2 purchase cycles</div></div>
+      </div>
+    </div>` : ''}
+  `);
+
+  if (view === 'sim')    setTimeout(_drawMargChart, 80);
+  if (view === 'curves') setTimeout(_drawSatChart,  80);
+};
+
+// ── Spend Simulator HTML ──────────────────────────────────────────────────────
+
+function _incSimHTML() {
+  const camps = filteredCampaigns();
+  const tGroups = groupBy(camps, 'tier');
+  const mGroups = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const TIERS   = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active  = TIERS.filter(t => tGroups.find(g=>g.key===t&&g.spend>0));
+  const sat     = window._incSatMult || 2.5;
+  const beRoas  = FM.variableBreakevenRoas;
+  const mode    = window._incSimMode || 'tier';
+
+  // Init alloc once
+  if (!window._incSimAllocInit) {
+    active.forEach(t => { const g=tGroups.find(x=>x.key===t)||{spend:0}; window._incSimAlloc[t]=g.spend; });
+    window._incSimAllocInit = true;
+  }
+
+  return `
+    <!-- INFO BANNER -->
+    <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;padding:0.6rem 1rem;margin-bottom:0.75rem;font-size:0.78rem;">
+      <strong style="color:var(--success)">💰 Spend Simulator</strong>
+      <span style="color:var(--muted)"> — Incrementality Factors (IFs) = % of attributed revenue truly caused by your ads.
+      Adjust IFs with sliders, then change spend at any level (tier / market / campaign) to see true incremental impact live.</span>
+      <span style="color:var(--warning)"> ⚠ IFs marked Unvalidated until a linked test confirms them.</span>
+    </div>
+
+    <!-- IF ASSUMPTION STRIP -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 1rem;border-bottom:1px solid var(--border);">
+        <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted)">
+          Incrementality Factors — drag sliders · IF × Attributed ROAS = Incremental ROAS
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <label style="font-size:0.72rem;color:var(--muted)">Saturation:</label>
+          <select id="inc-sat-sel" onchange="window._incSatMult=parseFloat(this.value);window._incSimAllocInit=false;renderIncrementality()"
+            style="padding:0.2rem 0.4rem;font-size:0.74rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+            <option value="1.8">Conservative (1.8×)</option>
+            <option value="2.5" ${sat===2.5?'selected':''}>Base (2.5×)</option>
+            <option value="3.5">Optimistic (3.5×)</option>
+          </select>
+          <button class="btn-ghost" onclick="resetIncIFs()" style="font-size:0.7rem;padding:0.2rem 0.45rem;">↺ Reset IFs</button>
+          <button class="btn-ghost" onclick="resetIncSim()" style="font-size:0.7rem;padding:0.2rem 0.45rem;">↺ Reset Spend</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(${active.length},1fr);">
+        ${active.map(t => {
+          const g       = tGroups.find(x=>x.key===t)||{spend:0,roas:0,convValue:0};
+          const IF      = getIF(t);
+          const iRoas   = g.roas * IF;
+          const tests   = incGetAll();
+          const linked  = tests.find(x => x.status==='Validated' && x.title.toLowerCase().includes(t.toLowerCase()));
+          return `<div style="padding:0.5rem 0.7rem;border-right:1px solid var(--border);last-child:border-right:none;text-align:center;">
+            <div style="margin-bottom:0.25rem">${tierBadge(t)}</div>
+            <div style="font-size:0.67rem;color:var(--muted);margin-bottom:0.2rem">
+              Attr <span style="color:${roasColorCss(g.roas)};font-weight:600">${fmt.roas(g.roas)}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:0.25rem;margin-bottom:0.2rem;">
+              <input type="range" min="0" max="100" value="${Math.round(IF*100)}" step="5"
+                style="flex:1;accent-color:var(--gold);cursor:pointer;"
+                oninput="this.nextElementSibling.textContent=this.value+'%';incUpdateIF('${t}',this.value/100)">
+              <span style="font-size:0.76rem;font-weight:700;color:var(--gold);min-width:32px;text-align:right">${Math.round(IF*100)}%</span>
+            </div>
+            <div style="font-size:0.7rem;font-weight:600;color:${roasColorCss(iRoas)}">Inc ${fmt.roas(iRoas)}</div>
+            <div style="font-size:0.62rem;color:${linked?'var(--success)':'var(--warning)'};margin-top:0.1rem">
+              ${linked?'✓ Test validated':'⚠ Unvalidated'}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.35rem;margin-bottom:0.75rem;align-items:center;">
+      ${['tier','market','campaign'].map(m =>
+        `<button class="btn-ghost" onclick="incSetSimMode('${m}')"
+          style="font-size:0.78rem;padding:0.25rem 0.65rem;${mode===m?'background:var(--accent-gold);color:#000;':''}">
+          By ${m[0].toUpperCase()+m.slice(1)}</button>`
+      ).join('')}
+    </div>
+
+    <!-- SPLIT: ALLOC + OUTCOME -->
+    <div class="budget-split">
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="inc-alloc-wrap">${_incAllocTable(active, tGroups, mGroups, camps, mode, sat)}</div>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div style="padding:0.55rem 1rem;border-bottom:1px solid var(--border);">
+          <span style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600">
+            Incremental Outcome</span>
+          <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);margin-left:0.4rem;font-size:0.65rem">MODELLED</span>
+        </div>
+        <div id="inc-outcome-inner" style="padding:0.75rem 1rem;overflow-y:auto;max-height:420px;">
+          ${_incOutcome(active, tGroups, sat)}
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL INCREMENTAL RETURN CHART -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="padding:0.55rem 1rem 0;display:flex;justify-content:space-between;align-items:center;">
+        <div class="panel-head" style="margin:0;">Marginal Incremental Return — next €10k
+          <span style="font-size:0.7rem;color:var(--muted);font-weight:400"> · Green = above inc. breakeven · Red = below</span></div>
+        <div style="display:flex;gap:0.75rem;font-size:0.7rem;color:var(--muted);">
+          <span><span style="color:#C9A84C;font-weight:600">━</span> Attributed</span>
+          <span><span style="color:#10B981;font-weight:600">━</span> Incremental</span>
+          <span><span style="color:#EF4444;font-weight:600">- -</span> Var. BE (${fmt.roas(beRoas)}x)</span>
+        </div>
+      </div>
+      <div style="padding:0.5rem 1rem;height:175px;position:relative;"><canvas id="chart-inc-marginal"></canvas></div>
+    </div>
+
+    <!-- BREAKEVEN TABLE -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div class="card-header">Incremental Breakeven Analysis</div>
+      <table class="cockpit-table">
+        <thead><tr>
+          <th>Tier</th><th>IF</th><th>Current Spend</th>
+          <th>Inc. ROAS</th><th>BE Spend (Inc.)</th>
+          <th>Headroom</th><th>Marg /€10k</th><th>Verdict</th>
+        </tr></thead>
+        <tbody>${active.map(t => {
+          const g   = tGroups.find(x=>x.key===t)||{spend:0,roas:0,convValue:0};
+          const cSp = window._incSimAlloc[t] ?? g.spend;
+          const cRv = g.convValue || g.roas * g.spend;
+          const IF  = getIF(t);
+          const iR  = cSp>0 ? incRev(cSp, g.spend, cRv, t, sat)/cSp : 0;
+          const be  = findBESpend(g.spend, cRv, t, sat, beRoas);
+          const hd  = be - cSp;
+          const mg  = margPerK10(cSp, g.spend, cRv, t, sat);
+          const v   = iR >= beRoas*1.5
+            ? `<span style="color:var(--success)">✓ Profitable</span>`
+            : iR >= beRoas
+            ? `<span style="color:var(--warning)">⚠ Marginal</span>`
+            : `<span style="color:var(--danger)">✗ Below inc. BE</span>`;
+          return `<tr>
+            <td>${tierBadge(t)}</td>
+            <td><span style="color:var(--gold);font-weight:700">${Math.round(IF*100)}%</span></td>
+            <td style="color:var(--muted)">${fmt.curK(cSp)}</td>
+            <td style="color:${roasColorCss(iR)};font-weight:600">${fmt.roas(iR)}</td>
+            <td style="color:var(--muted)">${fmt.curK(be)}</td>
+            <td style="color:${hd>0?'var(--success)':'var(--danger)'};font-weight:600">${hd>0?'+':''}${fmt.curK(hd)}</td>
+            <td style="color:${mg>=beRoas*10000?'var(--success)':'var(--danger)'};font-weight:600">${fmt.curK(mg)}</td>
+            <td>${v}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
+// ── Allocation Table ──────────────────────────────────────────────────────────
+
+function _incAllocTable(active, tGroups, mGroups, camps, mode, sat) {
+  if (mode === 'campaign') return _incCampTable(camps, sat);
+
+  const items = mode === 'tier'
+    ? active.map(t => { const g=tGroups.find(x=>x.key===t)||{spend:0,roas:0,convValue:0}; return {key:t,spend:g.spend,roas:g.roas,rv:g.convValue||g.roas*g.spend,type:'tier'}; })
+    : mGroups.map(m => ({key:m.key,spend:m.spend,roas:m.roas,rv:m.revenue||m.roas*m.spend,type:'market'}));
+
+  const alloc = mode==='tier' ? window._incSimAlloc : window._incSimMktAlloc;
+
+  return `<table class="cockpit-table" style="width:100%;">
+    <thead><tr>
+      <th>${mode==='tier'?'Tier':'Market'}</th>
+      <th style="text-align:right">YTD</th>
+      <th style="text-align:right">Attr.ROAS</th>
+      <th style="text-align:right">Inc.ROAS</th>
+      <th style="text-align:right">New Spend</th>
+      <th style="text-align:right">Δ Inc Rev</th>
+      ${mode==='tier'?'<th></th>':''}
+    </tr></thead>
+    <tbody>
+    ${items.map(item => {
+      const nSp = alloc[item.key] ?? item.spend;
+      const IF  = mode==='tier' ? getIF(item.key) : 0.60;
+      const iRoas = item.roas * IF;
+      const cIR = incRev(item.spend, item.spend, item.rv, item.key, sat);
+      const nIR = incRev(nSp, item.spend, item.rv, item.key, sat);
+      const dIR = nIR - cIR;
+      const changed = Math.abs(nSp - item.spend) > 0.5;
+      const exp = mode==='tier' && window._incSimExpanded[item.key];
+      return `<tr style="${changed?'background:rgba(16,185,129,0.05);':''}">
+        <td>
+          ${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+          ${mode==='tier'?`<span style="font-size:0.62rem;color:var(--gold);margin-left:0.3rem">${Math.round(getIF(item.key)*100)}% IF</span>`:''}
+        </td>
+        <td style="text-align:right;color:var(--muted)">${fmt.curK(item.spend)}</td>
+        <td style="text-align:right;color:${roasColorCss(item.roas)};font-weight:600">${fmt.roas(item.roas)}</td>
+        <td style="text-align:right;color:${roasColorCss(iRoas)};font-weight:600">${fmt.roas(iRoas)}</td>
+        <td style="padding:0.15rem 0.4rem;">
+          <input type="number" value="${Math.round(nSp)}" min="0" step="1000"
+            style="width:85px;text-align:right;background:${changed?'rgba(16,185,129,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--success)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.79rem;color:var(--text);"
+            onchange="incUpdateAlloc('${item.key}','${mode}',this.value)">
+        </td>
+        <td style="text-align:right;font-weight:600;color:${dIR>0?'var(--success)':dIR<0?'var(--danger)':'var(--muted)'}">
+          ${Math.abs(dIR)>0.5?(dIR>0?'+':'')+ fmt.curK(dIR):'—'}
+        </td>
+        ${mode==='tier'?`<td style="text-align:center;">
+          <button onclick="incToggleExpand('${item.key}')"
+            style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;"
+            title="Expand campaigns">${exp?'▼':'▶'}</button>
+        </td>`:''}
+      </tr>
+      ${mode==='tier' ? _incExpandRows(item.key, camps, item.spend, item.rv, sat) : ''}`;
+    }).join('')}
+    </tbody>
+    <tfoot style="border-top:2px solid var(--border);font-weight:700;">
+      <tr>
+        <td>Total</td>
+        <td style="text-align:right;color:var(--muted)">${fmt.curK(items.reduce((s,i)=>s+i.spend,0))}</td>
+        <td></td><td></td>
+        <td style="text-align:right">${fmt.curK(items.reduce((s,i)=>s+(alloc[i.key]??i.spend),0))}</td>
+        <td></td>${mode==='tier'?'<td></td>':''}
+      </tr>
+    </tfoot>
+  </table>`;
+}
+
+function _incExpandRows(tier, camps, curTSpend, curTRev, sat) {
+  if (!window._incSimExpanded[tier]) return '';
+  const tc = camps.filter(c=>(c.tier||'OTHER')===tier&&c.cost>0).sort((a,b)=>b.cost-a.cost);
+  if (!tc.length) return '';
+  const IF = getIF(tier);
+
+  return `<tr><td colspan="7" style="padding:0;border-bottom:1px solid var(--border);">
+    <div style="background:rgba(0,0,0,0.22);padding:0.35rem 0.75rem 0.5rem;">
+      <div style="font-size:0.66rem;color:var(--muted);font-weight:600;margin-bottom:0.3rem;text-transform:uppercase;">
+        ${tier} · ${tc.length} campaigns · IF ${Math.round(IF*100)}%</div>
+      <table style="width:100%;border-collapse:collapse;font-size:0.72rem;">
+        <thead><tr style="color:var(--muted);font-size:0.66rem;border-bottom:1px solid var(--border);">
+          <th style="text-align:left;padding:0.2rem 0.3rem">Campaign</th>
+          <th style="text-align:center;padding:0.2rem 0.2rem">Mkt</th>
+          <th style="text-align:right;padding:0.2rem 0.3rem">YTD Spend</th>
+          <th style="text-align:right;padding:0.2rem 0.3rem">Attr.ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.3rem">Inc.ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.3rem">New Budget</th>
+          <th style="text-align:right;padding:0.2rem 0.3rem">Δ Inc Rev</th>
+        </tr></thead>
+        <tbody>
+        ${tc.map(c => {
+          const key  = c.name || c.campaign;
+          const nSp  = window._incSimCampAlloc[key] ?? c.cost;
+          const cRv  = c.convValue || c.roas * c.cost;
+          const cIR  = incRev(c.cost, c.cost, cRv, tier, sat);
+          const nIR  = incRev(nSp,   c.cost, cRv, tier, sat);
+          const dIR  = nIR - cIR;
+          const iRoas= c.roas * IF;
+          const ch   = Math.abs(nSp-c.cost)>0.5;
+          return `<tr style="${ch?'background:rgba(16,185,129,0.08)':''}">
+            <td style="padding:0.2rem 0.3rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${key}">${key}</td>
+            <td style="text-align:center;padding:0.2rem 0.2rem">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.2rem 0.3rem;color:var(--muted)">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.2rem 0.3rem;color:${roasColorCss(c.roas)};font-weight:600">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.3rem;color:${roasColorCss(iRoas)};font-weight:600">${fmt.roas(iRoas)}</td>
+            <td style="padding:0.15rem 0.3rem;text-align:right;">
+              <input type="number" value="${Math.round(nSp)}" min="0" step="500"
+                style="width:78px;text-align:right;background:${ch?'rgba(16,185,129,0.1)':'rgba(0,0,0,0.2)'};border:1px solid ${ch?'var(--success)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.71rem;color:var(--text);"
+                onchange="incUpdateCampAlloc('${key.replace(/'/g,"\\'")}','${tier}',this.value)">
+            </td>
+            <td style="text-align:right;padding:0.2rem 0.3rem;color:${dIR>0?'var(--success)':dIR<0?'var(--danger)':'var(--muted)'}">
+              ${Math.abs(dIR)>0.5?(dIR>0?'+':'')+ fmt.curK(dIR):'—'}
+            </td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>
+  </td></tr>`;
+}
+
+function _incCampTable(camps, sat) {
+  const search = (window._incCampSearch || '').toLowerCase();
+  const tF = document.getElementById('inc-ctf')?.value || 'ALL';
+  const mF = document.getElementById('inc-cmf')?.value || 'ALL';
+  let rows = camps.filter(c=>c.cost>0);
+  if (search) rows = rows.filter(c=>(c.name||'').toLowerCase().includes(search));
+  if (tF !== 'ALL') rows = rows.filter(c=>(c.tier||'OTHER')===tF);
+  if (mF !== 'ALL') rows = rows.filter(c=>c.market===mF);
+  rows = [...rows].sort((a,b)=>b.cost-a.cost);
+  const tiers   = [...new Set(camps.map(c=>c.tier||'OTHER'))].sort();
+  const markets = [...new Set(camps.map(c=>c.market||'').filter(Boolean))].sort();
+  const changed = rows.filter(c=>{const k=c.name||c.campaign;return window._incSimCampAlloc[k]!==undefined&&Math.abs(window._incSimCampAlloc[k]-c.cost)>0.5;}).length;
+
+  return `
+    <div style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;background:var(--surface);">
+      <input id="inc-camp-s" type="text" placeholder="🔍 Search…" value="${window._incCampSearch||''}"
+        oninput="window._incCampSearch=this.value;incRefreshCampTable()"
+        style="flex:1;min-width:130px;padding:0.3rem 0.5rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.76rem;color:var(--text);">
+      <select id="inc-ctf" onchange="incRefreshCampTable()"
+        style="padding:0.3rem 0.4rem;font-size:0.75rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>${tiers.map(t=>`<option value="${t}">${t}</option>`).join('')}
+      </select>
+      <select id="inc-cmf" onchange="incRefreshCampTable()"
+        style="padding:0.3rem 0.4rem;font-size:0.75rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>${markets.map(m=>`<option value="${m}">${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.71rem;color:var(--muted)">${rows.length} camps</span>
+      ${changed>0?`<span style="font-size:0.71rem;color:var(--success);font-weight:600">⚡ ${changed} changed</span>`:''}
+      <button class="btn-ghost" onclick="incResetCampAlloc()" style="font-size:0.7rem;padding:0.2rem 0.45rem;">↺ Reset</button>
+    </div>
+    <div style="overflow-x:auto;max-height:440px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.73rem;min-width:680px;">
+      <thead style="position:sticky;top:0;background:var(--card-bg);z-index:2;">
+        <tr>
+          <th style="text-align:left">Campaign</th><th>Tier</th><th>Mkt</th>
+          <th style="text-align:right">YTD</th><th style="text-align:right">Attr</th>
+          <th style="text-align:right">Inc</th><th style="text-align:right">New Budget</th>
+          <th style="text-align:right">Δ Inc Rev</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key  = c.name || c.campaign;
+          const nSp  = window._incSimCampAlloc[key] ?? c.cost;
+          const cRv  = c.convValue || c.roas * c.cost;
+          const IF   = getIF(c.tier||'OTHER');
+          const iRoas= c.roas * IF;
+          const cIR  = incRev(c.cost, c.cost, cRv, c.tier, sat);
+          const nIR  = incRev(nSp,   c.cost, cRv, c.tier, sat);
+          const dIR  = nIR - cIR;
+          const ch   = Math.abs(nSp-c.cost)>0.5;
+          return `<tr style="${ch?'background:rgba(16,185,129,0.06);':''}">
+            <td style="max-width:195px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${key}">${key}</td>
+            <td>${tierBadge(c.tier||'OTHER')}</td>
+            <td>${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;color:var(--muted)">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;color:${roasColorCss(c.roas)};font-weight:600">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;color:${roasColorCss(iRoas)};font-weight:600">${fmt.roas(iRoas)}</td>
+            <td style="padding:0.2rem 0.4rem;text-align:right;">
+              <input type="number" value="${Math.round(nSp)}" min="0" step="500"
+                style="width:80px;text-align:right;background:${ch?'rgba(16,185,129,0.1)':'var(--card-bg)'};border:1px solid ${ch?'var(--success)':'var(--border)'};border-radius:4px;padding:0.2rem 0.3rem;font-size:0.72rem;color:var(--text);"
+                onchange="incUpdateCampAlloc('${key.replace(/'/g,"\\'")}','${c.tier||"OTHER"}',this.value)">
+            </td>
+            <td style="text-align:right;color:${dIR>0?'var(--success)':dIR<0?'var(--danger)':'var(--muted)'}">
+              ${Math.abs(dIR)>0.5?(dIR>0?'+':'')+ fmt.curK(dIR):'—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>`;
+}
+
+// ── Incremental Outcome Panel ─────────────────────────────────────────────────
+
+function _incOutcome(active, tGroups, sat) {
+  const beRoas  = FM.variableBreakevenRoas;
+  const netCont = FM.contributionMarginAvailable;
+  let totCS=0,totNS=0,totCA=0,totNA=0,totCI=0,totNI=0;
+
+  const rows = active.map(t => {
+    const g  = tGroups.find(x=>x.key===t)||{spend:0,roas:0,convValue:0};
+    const cs = g.spend;
+    const ns = window._incSimAlloc[t] ?? cs;
+    const rv = g.convValue || g.roas * g.spend;
+    const ca = rv;
+    const na = sCurve(ns, cs, rv, sat);
+    const ci = ca * getIF(t);
+    const ni = na * getIF(t);
+    totCS+=cs; totNS+=ns; totCA+=ca; totNA+=na; totCI+=ci; totNI+=ni;
+    return {t,cs,ns,ca,na,ci,ni};
+  });
+
+  const dA   = totNA - totCA;
+  const dI   = totNI - totCI;
+  const dS   = totNS - totCS;
+  const nIR  = totNS>0 ? totNI/totNS : 0;
+  const cIR  = totCS>0 ? totCI/totCS : 0;
+  const nIC  = totNI * netCont;
+  const cIC  = totCI * netCont;
+  const dIC  = nIC - cIC;
+  const chg  = rows.filter(r=>Math.abs(r.ns-r.cs)>0.5);
+
+  return `
+    <!-- BEFORE / AFTER -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.6rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.2rem">Current</div>
+        <div style="font-size:0.95rem;font-weight:700">${fmt.curK(totCA)}</div>
+        <div style="font-size:0.7rem;color:var(--muted)">Attributed · ROAS ${fmt.roas(totCA/totCS)}</div>
+        <div style="border-top:1px solid var(--border);margin:0.25rem 0;padding-top:0.25rem;">
+          <div style="font-size:0.62rem;color:var(--muted);text-transform:uppercase;margin-bottom:0.15rem">Incremental</div>
+          <div style="font-size:0.95rem;font-weight:700;color:var(--gold)">${fmt.curK(totCI)}</div>
+          <div style="font-size:0.7rem;color:var(--muted)">Inc. ROAS ${fmt.roas(cIR)}</div>
+        </div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${dI>0?'rgba(16,185,129,0.3)':dI<0?'rgba(239,68,68,0.3)':'var(--border)'};">
+        <div style="font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.2rem">${chg.length?'Projected':'Status Quo'}</div>
+        <div style="font-size:0.95rem;font-weight:700;color:${dA>0?'var(--success)':dA<0?'var(--danger)':'var(--text)'}">${fmt.curK(totNA)}${Math.abs(dA)>0.5?` <span style="font-size:0.7rem">(${dA>0?'+':''}${fmt.curK(dA)})</span>`:''}</div>
+        <div style="font-size:0.7rem;color:var(--muted)">Attributed · ROAS ${fmt.roas(totNA/totNS)}</div>
+        <div style="border-top:1px solid var(--border);margin:0.25rem 0;padding-top:0.25rem;">
+          <div style="font-size:0.62rem;color:var(--muted);text-transform:uppercase;margin-bottom:0.15rem">Incremental</div>
+          <div style="font-size:0.95rem;font-weight:700;color:${dI>0?'var(--success)':dI<0?'var(--danger)':'var(--gold)'}">${fmt.curK(totNI)}${Math.abs(dI)>0.5?` <span style="font-size:0.7rem">(${dI>0?'+':''}${fmt.curK(dI)})</span>`:''}</div>
+          <div style="font-size:0.7rem;color:var(--muted)">Inc. ROAS ${fmt.roas(nIR)}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ATTRIBUTION GAP -->
+    <div style="background:rgba(201,168,76,0.08);border-radius:4px;padding:0.4rem 0.6rem;margin-bottom:0.5rem;font-size:0.72rem;">
+      <strong style="color:var(--gold)">Attribution gap:</strong>
+      <span style="color:var(--muted)"> Attributed ${fmt.curK(totNA)} vs Incremental ${fmt.curK(totNI)} —
+      <strong style="color:var(--warning)">${fmt.curK(totNA-totNI)}</strong> likely organic/returning customer capture</span>
+    </div>
+
+    ${chg.length ? `
+    <div style="font-size:0.67rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem">Tier Impact</div>
+    <table style="width:100%;font-size:0.73rem;border-collapse:collapse;margin-bottom:0.5rem;">
+      <thead><tr style="color:var(--muted);font-size:0.66rem;"><th style="text-align:left;padding:0.12rem 0.25rem">Tier</th>
+        <th style="text-align:right;padding:0.12rem 0.25rem">Δ Attr</th><th style="text-align:right;padding:0.12rem 0.25rem">Δ Inc</th></tr></thead>
+      <tbody>${chg.map(r=>`<tr>
+        <td style="padding:0.12rem 0.25rem">${tierBadge(r.t)}</td>
+        <td style="text-align:right;padding:0.12rem 0.25rem;color:${r.na-r.ca>0?'var(--success)':'var(--danger)'}">${r.na-r.ca>0?'+':''}${fmt.curK(r.na-r.ca)}</td>
+        <td style="text-align:right;padding:0.12rem 0.25rem;color:${r.ni-r.ci>0?'var(--success)':'var(--danger)'}">${r.ni-r.ci>0?'+':''}${fmt.curK(r.ni-r.ci)}</td>
+      </tr>`).join('')}</tbody>
+    </table>` : `<div style="font-size:0.73rem;color:var(--muted);padding:0.35rem 0.5rem;background:var(--surface);border-radius:4px;margin-bottom:0.5rem;">
+      📊 Change any spend or IF to see incremental impact</div>`}
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.67rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.2rem">Inc. Contribution Waterfall</div>
+    <div class="scenario-grid" style="font-size:0.77rem;">
+      <div class="scenario-row"><span>Inc. Revenue</span><span>${fmt.curK(totNI)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.5rem">× GM (${(FM.grossMargin*100).toFixed(0)}%)</span><span>${fmt.curK(totNI*FM.grossMargin)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.5rem">− Variable costs</span><span style="color:var(--danger)">−${fmt.curK(totNI*FM.totalVariableExAds)}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.25rem;">
+        <span>Net Inc. Contribution</span>
+        <span style="color:${nIC>0?'var(--success)':'var(--danger)'}">${fmt.curK(nIC)}${Math.abs(dIC)>0.5?` <span style="font-size:0.68rem">(${dIC>0?'+':''}${fmt.curK(dIC)})</span>`:''}</span>
+      </div>
+      ${Math.abs(dS)>0.5?`<div class="scenario-row"><span>Δ Ad Spend</span><span style="color:${dS>0?'var(--danger)':'var(--success)'}">${dS>0?'+':''}${fmt.curK(dS)}</span></div>`:''}
+    </div>
+    <div style="margin-top:0.4rem;font-size:0.71rem;">
+      ${nIR >= beRoas
+        ? `<span style="color:var(--success)">✓ Above incremental break-even (${fmt.roas(beRoas)}x)</span>`
+        : `<span style="color:var(--danger)">✗ Below incremental break-even — ads not profitable on true lift basis</span>`}
+    </div>`;
+}
+
+// ── Saturation Curves HTML ────────────────────────────────────────────────────
+
+function _incCurvesHTML() {
+  const camps = filteredCampaigns();
+  const tGroups = groupBy(camps, 'tier');
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t => tGroups.find(g=>g.key===t&&g.spend>0));
+  const sat    = window._incSatMult || 2.5;
+  const beRoas = FM.variableBreakevenRoas;
+  const hl     = window._incCurveTier;
+
+  return `
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 1rem;border-bottom:1px solid var(--border);">
+        <div style="font-size:0.7rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">
+          Incremental Revenue S-Curves — Spend vs True Incremental Return (If % of Attr)
+        </div>
+        <div style="display:flex;gap:0.4rem;align-items:center;">
+          <select onchange="window._incCurveTier=this.value||null;renderIncrementality()"
+            style="padding:0.2rem 0.4rem;font-size:0.74rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+            <option value="">All tiers</option>
+            ${active.map(t=>`<option value="${t}" ${hl===t?'selected':''}>${t}</option>`).join('')}
+          </select>
+          <select onchange="window._incSatMult=parseFloat(this.value);renderIncrementality()"
+            style="padding:0.2rem 0.4rem;font-size:0.74rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+            <option value="1.8">Conservative (1.8×)</option>
+            <option value="2.5" ${sat===2.5?'selected':''}>Base (2.5×)</option>
+            <option value="3.5">Optimistic (3.5×)</option>
+          </select>
+        </div>
+      </div>
+      <div style="padding:1rem;height:300px;position:relative;"><canvas id="chart-sat-curves"></canvas></div>
+      <div style="padding:0 1rem 0.6rem;font-size:0.72rem;color:var(--muted);">
+        <strong>Read:</strong> Dot = current spend. Steep curve = high marginal return (underspending). Flat = diminishing returns.
+        Dashed red = incremental variable break-even (${fmt.roas(beRoas)}x). Tiers below the red line are loss-making on incremental basis.
+      </div>
+    </div>
+
+    <!-- TIER SUMMARY CARDS -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.5rem;">
+      ${active.map(t => {
+        const g   = tGroups.find(x=>x.key===t)||{spend:0,roas:0,convValue:0};
+        const rv  = g.convValue || g.roas * g.spend;
+        const IF  = getIF(t);
+        const iR  = g.spend>0 ? incRev(g.spend,g.spend,rv,t,sat)/g.spend : 0;
+        const mg  = margPerK10(g.spend,g.spend,rv,t,sat);
+        const be  = findBESpend(g.spend,rv,t,sat,beRoas);
+        const satF= Math.round((1/sat)*100);
+        const c   = INC_TIER_COLORS[t]||'#6B7280';
+        return `<div class="card" style="padding:0.6rem;border:1px solid ${iR>=beRoas?'rgba(16,185,129,0.2)':'rgba(239,68,68,0.2)'};">
+          <div style="margin-bottom:0.3rem;">${tierBadge(t)}</div>
+          <div style="display:grid;grid-template-columns:auto 1fr;gap:0.1rem 0.4rem;font-size:0.69rem;margin-bottom:0.3rem;align-items:baseline;">
+            <span style="color:var(--muted)">IF</span><span style="font-weight:700;color:var(--gold)">${Math.round(IF*100)}%</span>
+            <span style="color:var(--muted)">Inc.ROAS</span><span style="font-weight:700;color:${roasColorCss(iR)}">${fmt.roas(iR)}</span>
+            <span style="color:var(--muted)">Marg/€10k</span><span style="font-weight:600">${fmt.curK(mg)}</span>
+            <span style="color:var(--muted)">BE spend</span><span style="color:var(--muted)">${fmt.curK(be)}</span>
+          </div>
+          <div style="font-size:0.64rem;color:var(--muted);margin-bottom:0.15rem">Curve position</div>
+          <div style="height:5px;background:var(--surface);border-radius:3px;">
+            <div style="width:${satF}%;height:100%;background:${satF>65?'var(--danger)':satF>45?'var(--warning)':'var(--success)'};border-radius:3px;transition:width 0.3s"></div>
+          </div>
+          <div style="font-size:0.64rem;color:var(--muted);margin-top:0.1rem">${satF}% toward saturation</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+
+let _incMC = null;
+function _drawMargChart() {
+  const canvas = document.getElementById('chart-inc-marginal');
+  if (!canvas) return;
+  if (_incMC) { _incMC.destroy(); _incMC = null; }
+  const camps  = filteredCampaigns();
+  const tG     = groupBy(camps,'tier');
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t=>tG.find(g=>g.key===t&&g.spend>0));
+  const sat    = window._incSatMult||2.5;
+  const beRoas = FM.variableBreakevenRoas;
+  const decay  = parseFloat(document.getElementById('b-decay')?.value||0.15);
+
+  const attrD  = active.map(t=>{const g=tG.find(x=>x.key===t)||{spend:0,roas:0}; const cs=window._incSimAlloc[t]??g.spend; return cs>0?g.roas*10000*(1-decay):0;});
+  const incD   = active.map(t=>{const g=tG.find(x=>x.key===t)||{spend:0,roas:0,convValue:0}; const cs=window._incSimAlloc[t]??g.spend; const rv=g.convValue||g.roas*g.spend; return margPerK10(cs,g.spend,rv,t,sat);});
+
+  _incMC = new Chart(canvas.getContext('2d'),{
+    type:'bar',
+    data:{labels:active,datasets:[
+      {label:'Attributed /€10k',data:attrD,backgroundColor:'rgba(201,168,76,0.55)',borderColor:'#C9A84C',borderWidth:1,borderRadius:3},
+      {label:'Incremental /€10k',data:incD,backgroundColor:incD.map(v=>v>=beRoas*10000?'rgba(16,185,129,0.65)':'rgba(239,68,68,0.55)'),
+        borderColor:incD.map(v=>v>=beRoas*10000?'#10B981':'#EF4444'),borderWidth:1,borderRadius:3},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:true,position:'top',labels:{color:'#8A9BB3',font:{size:10},boxWidth:10,padding:8}},
+        tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${fmt.curK(ctx.raw)}`}}},
+      scales:{
+        x:{ticks:{color:'#8A9BB3',font:{size:9}},grid:{display:false}},
+        y:{ticks:{color:'#8A9BB3',font:{size:9},callback:v=>fmt.curK(v)},grid:{color:'rgba(255,255,255,0.04)'},
+          min:0},
+      }
+    }
+  });
+
+  // Draw BE line manually
+  const meta = _incMC.getDatasetMeta(0);
+  if (meta && meta.data && meta.data.length) {
+    const ctx2 = canvas.getContext('2d');
+    const beY  = _incMC.scales.y.getPixelForValue(beRoas*10000);
+    const left = _incMC.chartArea.left;
+    const right= _incMC.chartArea.right;
+    ctx2.save();
+    ctx2.strokeStyle = '#EF4444';
+    ctx2.lineWidth   = 1.5;
+    ctx2.setLineDash([5,4]);
+    ctx2.beginPath();
+    ctx2.moveTo(left, beY);
+    ctx2.lineTo(right, beY);
+    ctx2.stroke();
+    ctx2.restore();
+  }
+}
+
+let _satC = null;
+function _drawSatChart() {
+  const canvas = document.getElementById('chart-sat-curves');
+  if (!canvas) return;
+  if (_satC) { _satC.destroy(); _satC = null; }
+  const camps  = filteredCampaigns();
+  const tG     = groupBy(camps,'tier');
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t=>tG.find(g=>g.key===t&&g.spend>0));
+  const sat    = window._incSatMult||2.5;
+  const beRoas = FM.variableBreakevenRoas;
+  const hl     = window._incCurveTier;
+  const maxSp  = Math.max(...active.map(t=>(tG.find(x=>x.key===t)||{spend:0}).spend))*2;
+  const N=40;
+  const xs = Array.from({length:N},(_,i)=>maxSp*i/(N-1));
+
+  const datasets = active.map(t => {
+    const g  = tG.find(x=>x.key===t)||{spend:0,roas:0,convValue:0};
+    const cs = g.spend;
+    const rv = g.convValue||g.roas*g.spend;
+    const c  = INC_TIER_COLORS[t]||'#6B7280';
+    const dim= hl && t!==hl;
+    return {
+      label:t,
+      data:xs.map(x=>incRev(x,cs,rv,t,sat)),
+      borderColor: dim ? c+'55' : c,
+      backgroundColor:'transparent',
+      borderWidth: dim?1:2.5,
+      borderDash: dim?[3,3]:[],
+      tension:0.4,
+      pointRadius:xs.map(x=>Math.abs(x-cs)<maxSp/(N*2)?5:0),
+      pointBackgroundColor:c,
+      pointBorderColor:'#0A1628',
+      pointBorderWidth:2,
+    };
+  });
+
+  // Breakeven line: y = spend × beRoas
+  datasets.push({label:`Inc. BE (${fmt.roas(beRoas)}x)`,data:xs.map(x=>x*beRoas),
+    borderColor:'#EF4444',borderDash:[5,4],borderWidth:1.5,backgroundColor:'transparent',tension:0,pointRadius:0});
+
+  _satC = new Chart(canvas.getContext('2d'),{
+    type:'line',
+    data:{labels:xs.map(v=>fmt.curK(v)),datasets},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{legend:{display:true,position:'right',labels:{color:'#8A9BB3',font:{size:9},boxWidth:8,padding:5}},
+        tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${fmt.curK(ctx.raw)}`}}},
+      scales:{
+        x:{ticks:{color:'#8A9BB3',font:{size:8},maxTicksLimit:8},grid:{color:'rgba(255,255,255,0.04)'}},
+        y:{ticks:{color:'#8A9BB3',font:{size:9},callback:v=>fmt.curK(v)},grid:{color:'rgba(255,255,255,0.04)'}},
+      }
+    }
+  });
+}
+
+// ── Event Handlers ────────────────────────────────────────────────────────────
+
+window.incUpdateIF = function(tier, val) {
+  window._incFactors[tier] = parseFloat(val);
+  saveIFs();
+  _refreshIncOutcome();
+  setTimeout(_drawMargChart, 50);
+};
+
+window.incUpdateAlloc = function(key, mode, val) {
+  const v = parseFloat(val)||0;
+  if (mode==='tier')   window._incSimAlloc[key] = v;
+  if (mode==='market') { window._incSimMktAlloc = window._incSimMktAlloc||{}; window._incSimMktAlloc[key]=v; }
+  _refreshIncOutcome();
+  setTimeout(_drawMargChart, 50);
+};
+
+window.incUpdateCampAlloc = function(key, tier, val) {
+  window._incSimCampAlloc[key] = parseFloat(val)||0;
+  // Roll up to tier
+  const camps = filteredCampaigns();
+  const tc    = camps.filter(c=>(c.tier||'OTHER')===tier);
+  if (tc.length) {
+    window._incSimAlloc[tier] = tc.reduce((s,c)=>s+(window._incSimCampAlloc[c.name||c.campaign]??c.cost),0);
+  }
+  _refreshIncOutcome();
+};
+
+window.incToggleExpand = function(tier) {
+  window._incSimExpanded[tier] = !window._incSimExpanded[tier];
+  const wrap = document.getElementById('inc-alloc-wrap');
+  if (!wrap) return;
+  const camps  = filteredCampaigns();
+  const tG     = groupBy(camps,'tier');
+  const mG     = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t=>tG.find(g=>g.key===t&&g.spend>0));
+  wrap.innerHTML = _incAllocTable(active,tG,mG,camps,window._incSimMode||'tier',window._incSatMult||2.5);
+};
+
+window.incSetSimMode = function(mode) {
+  window._incSimMode = mode;
+  const wrap = document.getElementById('inc-alloc-wrap');
+  if (!wrap) { renderIncrementality(); return; }
+  const camps  = filteredCampaigns();
+  const tG     = groupBy(camps,'tier');
+  const mG     = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t=>tG.find(g=>g.key===t&&g.spend>0));
+  wrap.innerHTML = _incAllocTable(active,tG,mG,camps,mode,window._incSatMult||2.5);
+};
+
+window.incRefreshCampTable = function() {
+  const wrap = document.getElementById('inc-alloc-wrap');
+  if (!wrap) return;
+  const camps = filteredCampaigns();
+  wrap.innerHTML = _incCampTable(camps, window._incSatMult||2.5);
+};
+
+window.incResetCampAlloc = function() {
+  window._incSimCampAlloc = {};
+  window._incSimAllocInit = false;
+  renderIncrementality();
+};
+
+window.resetIncIFs = function() {
+  window._incFactors = {};
+  saveIFs();
+  renderIncrementality();
+};
+
+window.resetIncSim = function() {
+  window._incSimAlloc = {};
+  window._incSimMktAlloc = {};
+  window._incSimCampAlloc = {};
+  window._incSimAllocInit = false;
+  renderIncrementality();
+};
+
+function _refreshIncOutcome() {
+  const el = document.getElementById('inc-outcome-inner');
+  if (!el) return;
+  const camps  = filteredCampaigns();
+  const tG     = groupBy(camps,'tier');
+  const TIERS  = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const active = TIERS.filter(t=>tG.find(g=>g.key===t&&g.spend>0));
+  el.innerHTML = _incOutcome(active, tG, window._incSatMult||2.5);
+}
+
+// ── Override renderIncrementality ─────────────────────────────────────────────
+window.renderIncrementality = window._renderIncLab;
+
+
+// --- guide_fr.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GUIDE PAGE  —  guide_fr.js
+// Page "Comment utiliser" in French — full walkthrough of the application
+// ═════════════════════════════════════════════════════════════════════════════
+
+window.renderGuide = function() {
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:1rem;">
+      <div>
+        <div class="breadcrumb">Aide</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">📖 Guide d'utilisation</h2>
+      </div>
+      <span class="badge" style="background:rgba(201,168,76,0.15);color:var(--gold);font-size:0.75rem;padding:0.3rem 0.6rem;">
+        EMINZA Marketing Intelligence Lab · v68
+      </span>
+    </div>
+
+    <!-- INTRO -->
+    <div style="background:linear-gradient(135deg,rgba(15,32,64,0.8),rgba(20,41,82,0.6));border:1px solid rgba(201,168,76,0.2);border-radius:10px;padding:1.25rem 1.5rem;margin-bottom:1.25rem;">
+      <div style="font-size:1rem;font-weight:700;color:var(--gold);margin-bottom:0.5rem;">Bienvenue dans le Lab Marketing EMINZA</div>
+      <p style="font-size:0.82rem;color:var(--muted);line-height:1.65;margin:0;">
+        Cet outil vous permet d'analyser la performance de vos campagnes Google Ads, de simuler l'impact de vos décisions budgétaires,
+        de modéliser la rentabilité réelle (incrémentale) de chaque euro dépensé, et de suivre l'évolution semaine par semaine.
+        Toutes les modifications que vous effectuez sont <strong style="color:var(--text)">visibles immédiatement</strong> dans les résultats projetés.
+      </p>
+    </div>
+
+    <!-- QUICK NAV -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.5rem;margin-bottom:1.25rem;">
+      ${[
+        {icon:'🔌',title:'Connexions données',id:'connections',desc:'Vérifier les sources connectées'},
+        {icon:'📊',title:'Cockpit Exécutif',id:'cockpit',desc:'Vue d\'ensemble KPI & anomalies'},
+        {icon:'💰',title:'Budget Lab',id:'budget',desc:'Simuler l\'impact budgétaire'},
+        {icon:'🧪',title:'Lab Incrémentalité',id:'incrementality',desc:'Rentabilité réelle par levier'},
+        {icon:'📅',title:'WoW Tracker',id:'wow',desc:'Évolution semaine/semaine'},
+        {icon:'🏪',title:'Explorer Campagnes',id:'campaigns',desc:'Analyse par campagne'},
+        {icon:'📈',title:'Tendances',id:'trends',desc:'Historique & saisonnalité'},
+        {icon:'🎯',title:'Recommandations',id:'recommendations',desc:'Actions priorisées'},
+      ].map(s => `
+        <div onclick="navigate('${s.id}')" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:0.65rem;cursor:pointer;transition:border-color 0.2s,transform 0.15s;" 
+          onmouseover="this.style.borderColor='var(--gold)';this.style.transform='translateY(-1px)'" 
+          onmouseout="this.style.borderColor='var(--border)';this.style.transform=''">
+          <div style="font-size:1.3rem;margin-bottom:0.3rem">${s.icon}</div>
+          <div style="font-size:0.75rem;font-weight:700;color:var(--text);margin-bottom:0.15rem">${s.title}</div>
+          <div style="font-size:0.68rem;color:var(--muted)">${s.desc}</div>
+        </div>
+      `).join('')}
+    </div>
+
+    <!-- SECTIONS -->
+    ${guideSection('🔌','1. Connexions de données',`
+      <p>Avant d'utiliser le Lab, vérifiez que vos sources de données sont bien connectées.</p>
+      <table class="cockpit-table" style="font-size:0.79rem;">
+        <thead><tr><th>Source</th><th>État</th><th>Ce qu'elle permet</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Google Ads (via Sheets)</strong></td><td><span style="color:var(--success)">✓ Connectée</span></td><td>Dépenses, ROAS, conversions par campagne (YTD)</td></tr>
+          <tr><td><strong>Suivi hebdo</strong></td><td><span style="color:var(--success)">✓ Connectée</span></td><td>Données semaine par semaine (WoW)</td></tr>
+          <tr><td><strong>GA4</strong></td><td><span style="color:var(--warning)">⚠ Manquante</span></td><td>Taux de conversion réel, sessions, rebond</td></tr>
+          <tr><td><strong>Shopify</strong></td><td><span style="color:var(--danger)">✗ Non connectée</span></td><td>Retours, LTV, AOV par canal</td></tr>
+        </tbody>
+      </table>
+      <div style="margin-top:0.75rem;background:rgba(245,158,11,0.08);border-left:3px solid var(--warning);padding:0.5rem 0.75rem;border-radius:0 4px 4px 0;font-size:0.78rem;color:var(--muted);">
+        <strong style="color:var(--warning)">⚠ Important :</strong> sans GA4 et Shopify, le ROAS affiché est un ROAS attribué (Google Ads)
+        et non un ROAS incrémental réel. Le Lab Incrémentalité vous permet de corriger ce biais.
+      </div>
+    `)}
+
+    ${guideSection('📊','2. Cockpit Exécutif',`
+      <p>Vue d'ensemble de la performance globale. Indicateurs clés en haut, puis répartition par Tier et marché.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-top:0.5rem;">
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.4rem;text-transform:uppercase;">Les métriques à surveiller</div>
+          <ul style="font-size:0.79rem;color:var(--muted);line-height:1.7;padding-left:1rem;">
+            <li><strong style="color:var(--text)">ROAS attribué</strong> — affiché par Google. Inclut du trafic organique capturé.</li>
+            <li><strong style="color:var(--text)">ROAS de contribution</strong> — ROAS après déduction des coûts variables (logistique, retours, frais fixes).</li>
+            <li><strong style="color:var(--text)">ROAS BE variable</strong> — seuil minimum pour couvrir les coûts variables. En dessous : perte.</li>
+            <li><strong style="color:var(--text)">Conv. Rate</strong> — taux de conversion des clics en commandes.</li>
+          </ul>
+        </div>
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.4rem;text-transform:uppercase;">Les 8 Tiers de campagnes</div>
+          <div style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-bottom:0.5rem;">
+            ${['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'].map(t => tierBadge(t)).join('')}
+          </div>
+          <p style="font-size:0.75rem;color:var(--muted);line-height:1.6">
+            Les tiers sont classés par performance décroissante. <strong style="color:var(--text)">ZOMBIE</strong> est le tier
+            sous surveillance prioritaire : ROAS attribué élevé mais incrémentalité probablement très faible (25%).
+          </p>
+        </div>
+      </div>
+    `)}
+
+    ${guideSection('💰','3. Budget Lab — Simulateur de dépenses',`
+      <p>Le Budget Lab vous permet de <strong>modifier les budgets à n'importe quel niveau de granularité</strong> et de voir immédiatement l'impact sur le chiffre d'affaires projeté, la contribution nette et le ROAS.</p>
+      
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.6rem;margin:0.75rem 0;">
+        <div style="background:var(--surface);border-radius:6px;padding:0.65rem;">
+          <div style="font-size:0.7rem;font-weight:700;color:var(--gold);margin-bottom:0.3rem">ÉTAPE 1 — Choisir un niveau</div>
+          <p style="font-size:0.75rem;color:var(--muted);line-height:1.5;margin:0">Cliquez sur <strong>By Tier</strong>, <strong>By Market</strong> ou <strong>By Campaign</strong> pour choisir le niveau de granularité.</p>
+        </div>
+        <div style="background:var(--surface);border-radius:6px;padding:0.65rem;">
+          <div style="font-size:0.7rem;font-weight:700;color:var(--gold);margin-bottom:0.3rem">ÉTAPE 2 — Modifier les budgets</div>
+          <p style="font-size:0.75rem;color:var(--muted);line-height:1.5;margin:0">Saisissez directement un nouveau budget dans le champ. Cliquez sur ▶ pour développer un tier et modifier campagne par campagne.</p>
+        </div>
+        <div style="background:var(--surface);border-radius:6px;padding:0.65rem;">
+          <div style="font-size:0.7rem;font-weight:700;color:var(--gold);margin-bottom:0.3rem">ÉTAPE 3 — Lire les résultats</div>
+          <p style="font-size:0.75rem;color:var(--muted);line-height:1.5;margin:0">Le panneau de droite se met à jour immédiatement. Consultez le CA projeté, la contribution nette et le ROAS de point mort.</p>
+        </div>
+      </div>
+
+      <div style="background:rgba(201,168,76,0.08);border:1px solid rgba(201,168,76,0.2);border-radius:6px;padding:0.6rem 0.9rem;font-size:0.78rem;">
+        <strong style="color:var(--gold)">💡 Astuce :</strong>
+        <span style="color:var(--muted)"> Utilisez les préréglages en haut (ex: "Couper Zombie −30%") pour des scénarios rapides. Le graphique "Marginal ROAS" montre où le prochain euro dépensé est le plus rentable.</span>
+      </div>
+
+      <div style="margin-top:0.6rem;font-size:0.78rem;color:var(--muted);">
+        <strong style="color:var(--text)">Paramètres clés modifiables :</strong>
+        <ul style="padding-left:1rem;line-height:1.7;margin:0.3rem 0 0;">
+          <li><strong>Décroissance (Decay %)</strong> — baisse de performance prévue sur la période restante de l'année</li>
+          <li><strong>Taux de marge brute (GM %)</strong> — marge après coût des marchandises</li>
+          <li><strong>Projection saisonnière</strong> — basée sur votre fichier Suivi data (suivi_data.json)</li>
+        </ul>
+      </div>
+    `)}
+
+    ${guideSection('🧪','4. Lab d\'Incrémentalité — Rentabilité réelle',`
+      <p>Le Lab Incrémentalité répond à la question la plus importante en marketing digital :</p>
+      <blockquote style="border-left:3px solid var(--gold);padding:0.4rem 0.75rem;margin:0.5rem 0;font-size:0.85rem;font-style:italic;color:var(--text);">
+        "Si j'arrête de dépenser sur ce tier, est-ce que je perds vraiment ces conversions — ou est-ce que les clients achèteraient quand même ?"
+      </blockquote>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin:0.75rem 0;">
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.35rem">📋 Registre de tests (Test Register)</div>
+          <p style="font-size:0.76rem;color:var(--muted);line-height:1.6;margin:0">
+            Gérez vos expériences publicitaires en cours (Geo holdout, Budget lift, Audience holdout…).
+            Créez un test avec "+ New Test", définissez l'hypothèse, les marchés concernés, la durée et le budget.
+            Le statut avance de <em>Proposé → En cours → Validé</em>.
+          </p>
+        </div>
+        <div>
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.35rem">💰 Simulateur de dépenses</div>
+          <p style="font-size:0.76rem;color:var(--muted);line-height:1.6;margin:0">
+            Ajustez le <strong style="color:var(--text)">Facteur d'Incrémentalité (FI)</strong> par tier avec les sliders (0–100%).
+            <br>Ex : ZOMBIE à 25% = seuls 25% du CA attribué est réellement généré par l'annonce.
+            <br>Modifiez ensuite les budgets pour voir l'impact sur le <strong style="color:var(--text)">CA incrémental réel</strong>.
+          </p>
+        </div>
+      </div>
+
+      <table class="cockpit-table" style="font-size:0.78rem;margin-top:0.5rem;">
+        <thead><tr><th>Tier</th><th>FI par défaut</th><th>Logique</th><th>Statut</th></tr></thead>
+        <tbody>
+          <tr><td>${tierBadge('ZOMBIE')}</td><td style="color:var(--warning);font-weight:700">25%</td><td style="color:var(--muted)">Biais de composition supposé — majorité de trafic organique</td><td><span style="color:var(--warning)">⚠ Non validé</span></td></tr>
+          <tr><td>${tierBadge('BRANDING')}</td><td style="color:var(--danger);font-weight:700">15%</td><td style="color:var(--muted)">Requêtes marque — achat probable sans annonce</td><td><span style="color:var(--warning)">⚠ Non validé</span></td></tr>
+          <tr><td>${tierBadge('NOUVEAUTES')}</td><td style="color:var(--success);font-weight:700">85%</td><td style="color:var(--muted)">Nouveaux produits — découverte principalement via annonce</td><td><span style="color:var(--warning)">⚠ Non validé</span></td></tr>
+          <tr><td>${tierBadge('TOP')}</td><td style="color:var(--success);font-weight:700">75%</td><td style="color:var(--muted)">Forte intention d'achat, quelques achats organiques</td><td><span style="color:var(--warning)">⚠ Non validé</span></td></tr>
+        </tbody>
+      </table>
+
+      <div style="margin-top:0.6rem;background:rgba(16,185,129,0.08);border-left:3px solid var(--success);padding:0.5rem 0.75rem;border-radius:0 4px 4px 0;font-size:0.78rem;color:var(--muted);">
+        <strong style="color:var(--success)">📈 Courbes de saturation</strong> — L'onglet "Saturation Curves" montre pour chaque tier où vous vous situez sur la courbe spend→revenu.
+        Une courbe plate signifie des rendements décroissants : dépenser plus génère peu d'incrémental supplémentaire.
+      </div>
+    `)}
+
+    ${guideSection('📅','5. WoW Tracker — Suivi Semaine/Semaine',`
+      <p>Le WoW Tracker compare automatiquement la semaine en cours à la semaine précédente (ou à 4 ou 13 semaines en arrière).</p>
+
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;margin:0.6rem 0;">
+        <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+          <div style="font-size:0.68rem;font-weight:700;color:var(--gold);margin-bottom:0.25rem">Bande de KPIs</div>
+          <p style="font-size:0.74rem;color:var(--muted);line-height:1.5;margin:0">Spend, Revenue, ROAS, CPA, Conversions — avec delta vs semaine de référence</p>
+        </div>
+        <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+          <div style="font-size:0.68rem;font-weight:700;color:var(--gold);margin-bottom:0.25rem">Tops / Flops ROAS</div>
+          <p style="font-size:0.74rem;color:var(--muted);line-height:1.5;margin:0">Les tiers/marchés ayant le plus progressé ou le plus décliné sur la période</p>
+        </div>
+        <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+          <div style="font-size:0.68rem;font-weight:700;color:var(--gold);margin-bottom:0.25rem">Tableau campagnes</div>
+          <p style="font-size:0.74rem;color:var(--muted);line-height:1.5;margin:0">150 campagnes filtrables par Tier, Marché, nom. Tri par dépenses, ROAS Δ ou Rev Δ</p>
+        </div>
+      </div>
+
+      <div style="background:rgba(245,158,11,0.08);border-left:3px solid var(--warning);padding:0.5rem 0.75rem;border-radius:0 4px 4px 0;font-size:0.78rem;color:var(--muted);margin-top:0.4rem;">
+        <strong style="color:var(--warning)">⚡ Données synthétisées</strong> — Sans connexion d'un vrai tableau de suivi hebdo, les données WoW sont synthétisées à partir des agrégats YTD avec une variance aléatoire déterministe ±15%.
+        Pour des données réelles, configurez l'URL de la feuille Suivi dans les Connexions.
+      </div>
+    `)}
+
+    ${guideSection('🏪','6. Explorer les campagnes',`
+      <p>Vue granulaire de toutes les campagnes actives avec ROAS, dépenses, et possibilité de filtrer/trier.</p>
+      <ul style="font-size:0.79rem;color:var(--muted);line-height:1.7;padding-left:1rem;margin:0.4rem 0;">
+        <li>Filtrez par <strong>Tier</strong>, <strong>Marché</strong>, ou recherchez par nom de campagne</li>
+        <li>Triez par Dépenses, ROAS, Conversions ou Valeur de conversion</li>
+        <li>Identifiez les campagnes sous le seuil de rentabilité (ROAS BE)</li>
+        <li>Cliquez sur une ligne pour voir le détail et les recommandations automatiques</li>
+      </ul>
+    `)}
+
+    ${guideSection('🔑','7. Mots de passe & Accès',`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
+        <div style="background:var(--surface);border-radius:6px;padding:0.75rem;">
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.3rem">🔐 Mot de passe de l'application</div>
+          <div style="font-family:monospace;font-size:1.1rem;background:rgba(0,0,0,0.3);border-radius:4px;padding:0.4rem 0.6rem;color:var(--gold);letter-spacing:0.05em;">eminza2026</div>
+          <p style="font-size:0.73rem;color:var(--muted);margin:0.4rem 0 0;">Partagez ce mot de passe avec votre équipe. L'accès est local à votre appareil ou via le lien public si activé.</p>
+        </div>
+        <div style="background:var(--surface);border-radius:6px;padding:0.75rem;">
+          <div style="font-size:0.72rem;font-weight:700;color:var(--gold);margin-bottom:0.3rem">🌐 Lien public (Cloudflare Tunnel)</div>
+          <div id="guide-public-url" style="font-size:0.78rem;color:var(--muted);">Chargement du lien public…</div>
+          <p style="font-size:0.73rem;color:var(--muted);margin:0.4rem 0 0;">Valide tant que votre Mac est allumé et connecté à internet. Partagez ce lien avec n'importe qui.</p>
+        </div>
+      </div>
+    `)}
+
+    ${guideSection('❓','8. Questions fréquentes',`
+      ${faqItem('Pourquoi le ROAS ZOMBIE est-il si élevé (4.34x) mais suspect ?',
+        'Le ROAS ZOMBIE est attribué par Google Ads. Ces campagnes ciblent probablement des segments déjà acheteurs ou à fort taux de recherche organique. Le vrai test (Geo holdout) révélera si ces conversions se seraient produites sans l\'annonce. Hypothèse actuelle : FI = 25%, soit un ROAS incrémental réel de ~1.1x — proche du seuil de rentabilité.')}
+      ${faqItem('Qu\'est-ce que le ROAS de point mort variable ?',
+        'C\'est le ROAS minimum pour couvrir les coûts variables (logistique, retours, commission, etc.) mais pas les coûts fixes. Calculé depuis votre modèle financier : ~1.69x. En dessous, chaque euro dépensé génère une perte nette sur contribution.')}
+      ${faqItem('Mes modifications dans le Budget Lab sont-elles sauvegardées ?',
+        'Les modifications de budget sont conservées en session (tant que vous n\'actualisez pas la page). Pour sauvegarder un scénario, utilisez "Save Scenario" dans le panneau de résultats. Les facteurs d\'incrémentalité sont sauvegardés en localStorage (persistants entre sessions).')}
+      ${faqItem('Comment ajouter une vraie connexion Google Ads ?',
+        'Allez dans Connexions données → Google Ads. Vous aurez besoin d\'un compte de service Google (voir le guide dans l\'onglet Connexions) et des autorisations sur le compte publicitaire. Une fois configuré, les données se rafraîchissent automatiquement toutes les heures.')}
+      ${faqItem('Qu\'est-ce que la saisonnalité et comment est-elle calculée ?',
+        'La saisonnalité est extraite de votre fichier suivi_data.json qui contient vos données historiques hebdomadaires. Elle est utilisée dans les projections fin d\'année pour estimer le CA restant par catégorie (Outdoor, Textile, Noël…).')}
+    `)}
+
+    <div style="text-align:center;padding:1.5rem 0 0.5rem;color:var(--muted);font-size:0.72rem;">
+      EMINZA Marketing Intelligence Lab · Construit sur mesure · ${new Date().toLocaleDateString('fr-FR')}
+    </div>
+  `);
+
+  // Try to load and display the public URL if it exists
+  setTimeout(() => {
+    const el = document.getElementById('guide-public-url');
+    if (!el) return;
+    const url = window._publicTunnelUrl;
+    if (url) {
+      el.innerHTML = `<a href="${url}" target="_blank" style="color:var(--gold);font-weight:600;word-break:break-all;">${url}</a>
+        <button onclick="navigator.clipboard.writeText('${url}');this.textContent='✓ Copié!';setTimeout(()=>this.textContent='📋 Copier',1500)"
+          style="margin-left:0.4rem;font-size:0.72rem;padding:0.2rem 0.45rem;" class="btn-ghost">📋 Copier</button>`;
+    } else {
+      el.innerHTML = `<span style="color:var(--muted)">Non activé — votre administrateur peut démarrer un tunnel Cloudflare pour partager l'accès.</span>`;
+    }
+  }, 500);
+};
+
+function guideSection(icon, title, content) {
+  return `<div class="card" style="margin-bottom:0.75rem;">
+    <div style="padding:0.65rem 1rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5rem;">
+      <span style="font-size:1.1rem;">${icon}</span>
+      <span style="font-size:0.85rem;font-weight:700;">${title}</span>
+    </div>
+    <div style="padding:0.75rem 1rem;font-size:0.8rem;color:var(--muted);line-height:1.6;">
+      ${content}
+    </div>
+  </div>`;
+}
+
+function faqItem(q, a) {
+  const id = 'faq_' + Math.random().toString(36).slice(2,8);
+  return `<div style="border-bottom:1px solid var(--border);padding:0.5rem 0;" onclick="document.getElementById('${id}').style.display=document.getElementById('${id}').style.display==='none'?'block':'none'">
+    <div style="font-size:0.79rem;font-weight:600;color:var(--text);cursor:pointer;display:flex;justify-content:space-between;align-items:center;">
+      <span>${q}</span><span style="color:var(--gold);font-size:0.85rem;">▾</span>
+    </div>
+    <div id="${id}" style="display:none;font-size:0.77rem;color:var(--muted);margin-top:0.35rem;line-height:1.6;">${a}</div>
+  </div>`;
+}

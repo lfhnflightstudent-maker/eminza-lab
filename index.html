@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eminza Marketing Intelligence & Optimisation Lab</title>
+  <meta name="description" content="Internal marketing analytics platform — Eminza Group. Read-only analytical tool.">
+  <link rel="stylesheet" href="styles.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+  <!-- Catch any script errors and show them on screen -->
+  <script>
+    window.onerror = function(msg, src, line, col, err) {
+      var box = document.getElementById('app-content') || document.body;
+      box.style.display = 'block';
+      box.innerHTML = '<div style="padding:2rem;color:#EF4444;font-family:monospace;font-size:0.85rem">'
+        + '<b>JS Error (line ' + line + '):</b> ' + msg + '<br>'
+        + '<small>' + (src||'') + '</small>'
+        + '</div>';
+      return false;
+    };
+  </script>
+</head>
+<body>
+
+  <!-- LOGIN SCREEN -->
+  <div id="login-screen">
+    <div style="text-align:center; margin-bottom:2.5rem;">
+      <div style="font-size:0.75rem;letter-spacing:0.3em;color:var(--muted);text-transform:uppercase;margin-bottom:0.5rem;">Eminza Group — Internal Use Only</div>
+      <h1 style="font-size:1.6rem;font-weight:700;letter-spacing:0.08em;color:var(--accent-gold);">MARKETING INTELLIGENCE<br>&amp; OPTIMISATION LAB</h1>
+    </div>
+    <div class="login-box">
+      <p style="margin-bottom:1.5rem;color:var(--muted);font-size:0.875rem;">Enter your password to access the lab</p>
+      <input type="password" id="password-input" placeholder="Password" autocomplete="current-password">
+      <button id="login-btn">ACCESS LAB</button>
+      <div id="login-error" style="color:var(--danger);margin-top:1rem;font-size:0.85rem;display:none;">
+        ⚠ Incorrect password.
+      </div>
+      <div style="margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border-color);font-size:0.75rem;color:var(--muted);">
+        READ-ONLY · No operational changes are made
+      </div>
+    </div>
+  </div>
+
+  <!-- APPLICATION SHELL — populated by app.js -->
+  <div id="app-content" style="display:none; height:100vh; overflow:hidden;"></div>
+
+  <script>
+    (function() {
+      var PWD = 'eminza2026';
+
+      function showApp() {
+        document.getElementById('login-screen').style.display = 'none';
+        document.getElementById('app-content').style.display = 'block';
+        // If app.js loaded and boot is ready, call it
+        if (typeof window.boot === 'function') {
+          window.boot();
+        } else {
+          // Wait up to 10 seconds for app.js to finish loading
+          var attempts = 0;
+          var poll = setInterval(function() {
+            attempts++;
+            if (typeof window.boot === 'function') {
+              clearInterval(poll);
+              window.boot();
+            } else if (attempts > 100) {
+              clearInterval(poll);
+              document.getElementById('app-content').innerHTML =
+                '<div style="padding:2rem;color:#EF4444">'
+                + '⚠ app.js failed to load boot(). '
+                + 'Check: is the server running? Try Cmd+Shift+R.'
+                + '</div>';
+            }
+          }, 100);
+        }
+      }
+
+      function doLogin() {
+        var val = document.getElementById('password-input').value;
+        if (val === PWD) {
+          try { sessionStorage.setItem('eminza_auth', '1'); } catch(e) {}
+          showApp();
+        } else {
+          document.getElementById('login-error').style.display = 'block';
+          document.getElementById('password-input').value = '';
+          document.getElementById('password-input').focus();
+        }
+      }
+
+      document.addEventListener('DOMContentLoaded', function() {
+        var btn = document.getElementById('login-btn');
+        var inp = document.getElementById('password-input');
+        if (btn) btn.addEventListener('click', doLogin);
+        if (inp) inp.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') doLogin();
+        });
+        // Auto-boot if already authenticated
+        try {
+          if (sessionStorage.getItem('eminza_auth') === '1') {
+            showApp();
+          }
+        } catch(e) {}
+        if (inp) inp.focus();
+      });
+    })();
+  </script>
+
+  <script src="app.js?v=20260814-69" onerror="document.getElementById('app-content').style.display='block';document.getElementById('app-content').innerHTML='<div style=padding:2rem;color:#EF4444>⚠ Failed to load app.js — server may be down</div>'"></script>
+</body>
+</html>
