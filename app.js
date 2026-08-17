@@ -52,7 +52,14 @@ window.EMINZA = {
   weekly:    [],
   suivi:     [],
   lastRefresh: null,
-  dataSource: 'Google Sheets CSV (GID 137941485)'
+  dataSource: 'Google Sheets CSV (GID 137941485)',
+  ga4: {
+    ready: false,
+    campaigns: [], byTier: {}, byMarket: {},
+    weekly: [], sources: [], devices: [], countries: [],
+    newVsReturning: { new: { sessions:0, cvr:0, revenue:0 }, returning: { sessions:0, cvr:0, revenue:0 } },
+    impliedIncrementalLift: 0, returningShare: 0, lastFetched: null
+  }
 };
 let activeCharts  = {};
 let currentNav    = 'cockpit';
@@ -77,6 +84,10 @@ function boot() {
   setTimeout(function() {
     if (typeof loadSuiviData === 'function') loadSuiviData();
   }, 1200);
+  // GA4 auto-connect — runs silently in background, non-blocking
+  setTimeout(function() {
+    if (typeof window.ga4BootConnect === 'function') window.ga4BootConnect();
+  }, 1500);
 }
 
 // ── Data loading ─────────────────────────────────────────────
@@ -319,6 +330,9 @@ function renderShell() {
     { id:'budget',          icon:'💰', label:'Budget Lab' },
     { id:'incrementality',  icon:'🔬', label:'Incrementality Lab' },
     { group: 'Intelligence' },
+    { id:'attribution',     icon:'🎯', label:'Attribution Intelligence' },
+    { id:'audience',        icon:'👥', label:'Audience Intelligence' },
+    { id:'ga4',             icon:'📊', label:'GA4 Analytics' },
     { id:'ai',              icon:'🤖', label:'AI Analyst' },
     { id:'recommendations', icon:'📝', label:'Recommendations' },
     { group: 'Reference' },
@@ -347,6 +361,9 @@ function renderShell() {
         </div>
         <nav class="nav-menu">${navHtml}</nav>
         <div class="sidebar-footer">
+          <div id="ga4-sidebar-badge" style="font-size:0.72rem;padding:0.3rem 0;margin-bottom:4px;cursor:pointer" onclick="navigate('ga4')">
+            ○ GA4 — click to connect
+          </div>
           <div id="data-status" class="data-status">Loading...</div>
           <button class="btn-ghost" onclick="manualRefresh()" style="margin-top:8px;width:100%">↻ Refresh data</button>
           <button class="btn-ghost" onclick="sessionStorage.clear();location.reload()" style="margin-top:4px;width:100%">Sign out</button>
@@ -370,7 +387,28 @@ function renderShell() {
         <div id="main-content" class="main-content"></div>
       </div>
     </div>`;
+
+  // Update GA4 badge after render (may already be connected)
+  setTimeout(updateGA4SidebarBadge, 200);
 }
+
+function updateGA4SidebarBadge() {
+  const el = document.getElementById('ga4-sidebar-badge');
+  if (!el) return;
+  if (window.EMINZA.ga4?.ready) {
+    el.innerHTML = '<span style="color:#10B981">● GA4 connected</span>';
+  } else {
+    el.innerHTML = '<span style="color:#F59E0B">○ GA4 — click to connect</span>';
+  }
+}
+
+// Listen for GA4 ready event to update badge + re-render if on a GA4-dependent page
+window.addEventListener('ga4ready', function() {
+  updateGA4SidebarBadge();
+  // Re-render current section if it uses GA4 data
+  const ga4Pages = ['ga4','attribution','audience','budget','incrementality'];
+  if (ga4Pages.includes(currentNav)) renderSection();
+});
 
 window.navigate = function(id) {
   currentNav = id;
@@ -399,7 +437,9 @@ function renderSection() {
     recommendations: renderRecommendations,
     skus:            renderSKUs,
     dictionary:      renderDictionary,
-    ga4:             renderGA4,
+    ga4:             window.renderGA4,
+    attribution:     function() { if (typeof window.renderAttributionIntelligence === 'function') window.renderAttributionIntelligence(); else setMain('<div class="callout">Attribution Intelligence loading...</div>'); },
+    audience:        function() { if (typeof window.renderAudienceIntelligence === 'function') window.renderAudienceIntelligence(); else setMain('<div class="callout">Audience Intelligence loading...</div>'); },
     guide:           renderGuide,
   };
   try {
@@ -26896,6 +26936,1453 @@ window.refreshCategory = function() {
 // --- wow_trends.js ---
 
 // ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+
+async function loadSuiviData() {
+  // Try local server first, then fall back to static suivi_data.json
+  const tryFetch = async (url) => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  };
+
+  try {
+    let json;
+    try {
+      json = await tryFetch('/api/suivi');
+    } catch(e) {
+      // No local server — load the static JSON file deployed alongside the app
+      json = await tryFetch('./suivi_data.json');
+    }
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
 // WEEKLY DATA ENGINE
 // Synthesises week-by-week data from YTD aggregates until real
 // weekly Google Sheets data is available.
@@ -28231,6 +29718,15 @@ function findBESpend(curSpend, curRev, tier, satMult, targetRoas) {
 
 // ── Main render ───────────────────────────────────────────────────────────────
 
+window._applyGA4Lift = function() {
+  const lift = Math.round(window.EMINZA.ga4?.impliedIncrementalLift || 25);
+  if (window._incFactors) {
+    window._incFactors.ZOMBIE = lift / 100;
+    localStorage.setItem('eminza_inc_factors_v2', JSON.stringify(window._incFactors));
+  }
+  window.navigate('incrementality');
+};
+
 window._renderIncLab = function() {
   const tests = incGetAll();
   const view  = window._incView || 'board';
@@ -28244,7 +29740,21 @@ window._renderIncLab = function() {
     `<button class="btn-ghost" onclick="window._incView='${v}';renderIncrementality()"
       style="font-size:0.78rem;padding:0.25rem 0.65rem;${view===v?'background:var(--accent-gold);color:#000;':''}${extra}">${icon} ${label}</button>`;
 
+  const ga4Banner = window.EMINZA.ga4?.ready 
+    ? `<div style="background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--gold);border-radius:8px;padding:1rem 1.25rem;margin-bottom:1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem">
+  <div>
+    <div style="font-size:0.78rem;color:var(--muted);margin-bottom:0.2rem">GA4 ESTIMATE</div>
+    <div style="font-size:1.2rem;font-weight:700;color:var(--gold)">${Math.round(window.EMINZA.ga4.impliedIncrementalLift || 0)}% Implied Incremental Lift</div>
+    <div style="font-size:0.78rem;color:var(--muted)">Based on new vs returning user CVR differential in GA4</div>
+  </div>
+  <button onclick="window._applyGA4Lift()" style="background:var(--gold);color:#000;border:none;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap;font-size:0.85rem">
+    Apply to ZOMBIE
+  </button>
+</div>`
+    : `<div style="background:rgba(245,158,11,0.1);border:1px solid var(--warning);border-radius:6px;padding:0.5rem 1rem;margin-bottom:1rem;color:var(--warning);font-size:0.85rem;">Connect GA4 for data-driven lift estimates →</div>`;
+
   setMain(`
+    ${ga4Banner}
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;flex-wrap:wrap;gap:0.4rem;">
       <div>
         <div class="breadcrumb">Planning</div>
@@ -29270,378 +30780,942 @@ function faqItem(q, a) {
 
 
 // --- ga4.js ---
-
-// ═════════════════════════════════════════════════════════════
-// GA4 ANALYTICS MODULE
-// OAuth2 client-side via Google Identity Services (GIS)
-// GA4 Data API v1beta — no server required
-// ═════════════════════════════════════════════════════════════
-
 const GA4_CLIENT_ID = '558659368073-3iam3r62t7htp9oo41kp4od7vtltrktr.apps.googleusercontent.com';
 const GA4_PROPERTY  = '549839891';
 const GA4_SCOPE     = 'https://www.googleapis.com/auth/analytics.readonly';
-const GA4_API       = `https://analyticsdata.googleapis.com/v1beta/properties/${GA4_PROPERTY}`;
+const GA4_API       = 'https://analyticsdata.googleapis.com/v1beta/properties/' + GA4_PROPERTY;
 
-let _ga4Token      = null;  // { access_token, expires_at }
-let _ga4TokenClient = null;
+window.EMINZA = window.EMINZA || {};
+window.EMINZA.ga4 = {
+    ready: false,
+    campaigns: [],
+    byTier: {},
+    byMarket: {},
+    weekly: [],
+    sources: [],
+    devices: [],
+    countries: [],
+    newVsReturning: { new: { sessions: 0, cvr: 0, revenue: 0 }, returning: { sessions: 0, cvr: 0, revenue: 0 } },
+    impliedIncrementalLift: 0,
+    returningShare: 0,
+    lastFetched: null
+};
 
-function ga4IsConnected() {
-  return !!(_ga4Token && _ga4Token.expires_at > Date.now() + 30000);
-}
+window.ga4IsConnected = function() {
+    const tokenStr = sessionStorage.getItem('eminza_ga4_token');
+    if (!tokenStr) return false;
+    try {
+        const token = JSON.parse(tokenStr);
+        if (token.access_token && token.expires_at) {
+            return Date.now() < (token.expires_at - 60000);
+        }
+    } catch(e) {}
+    return false;
+};
 
-function ga4Connect(onSuccess) {
-  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
-    const msg = document.getElementById('ga4-connect-msg');
-    if (msg) msg.textContent = '⚠ Google Identity Services not loaded — check internet connection.';
-    return;
-  }
-  _ga4TokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: GA4_CLIENT_ID,
-    scope: GA4_SCOPE,
-    callback: (resp) => {
-      if (resp.error) {
-        console.error('[GA4] OAuth error:', resp.error);
-        const msg = document.getElementById('ga4-connect-msg');
-        if (msg) msg.textContent = '⚠ Auth failed: ' + resp.error;
+window.ga4Connect = function(onSuccess) {
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+        console.error("Google Identity Services not loaded");
         return;
-      }
-      _ga4Token = {
-        access_token: resp.access_token,
-        expires_at: Date.now() + (resp.expires_in * 1000)
-      };
-      if (onSuccess) onSuccess();
     }
-  });
-  _ga4TokenClient.requestAccessToken({ prompt: '' });
-}
+    const client = window.google.accounts.oauth2.initTokenClient({
+        client_id: GA4_CLIENT_ID,
+        scope: GA4_SCOPE,
+        callback: function(response) {
+            if (response.error) {
+                console.error(response);
+                return;
+            }
+            sessionStorage.setItem('eminza_ga4_token', JSON.stringify({
+                access_token: response.access_token,
+                expires_at: Date.now() + (response.expires_in * 1000)
+            }));
+            if (onSuccess) onSuccess();
+        }
+    });
+    
+    // Try silent first, then fallback to prompt
+    client.requestAccessToken({ prompt: '' });
+};
+
+window.ga4Disconnect = function() {
+    sessionStorage.removeItem('eminza_ga4_token');
+    window.EMINZA.ga4.ready = false;
+    window.renderGA4();
+};
 
 async function ga4Report(body) {
-  const r = await fetch(`${GA4_API}:runReport`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${_ga4Token.access_token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-  if (r.status === 401) {
-    _ga4Token = null;   // Token expired — force reconnect
-    throw new Error('Token expired — please reconnect.');
+    const tokenStr = sessionStorage.getItem('eminza_ga4_token');
+    if (!tokenStr) throw 'reconnect';
+    let token = {};
+    try { token = JSON.parse(tokenStr); } catch(e) {}
+    if (!token.access_token) throw 'reconnect';
+    
+    const res = await fetch(GA4_API + ':runReport', {
+        method: 'POST',
+        headers: {
+            'Authorization': 'Bearer ' + token.access_token,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+    
+    if (res.status === 401) {
+        sessionStorage.removeItem('eminza_ga4_token');
+        throw 'reconnect';
+    }
+    if (!res.ok) {
+        throw new Error('GA4 API Error: ' + res.statusText);
+    }
+    return await res.json();
+}
+
+window.ga4LoadAll = function() {
+    const dateRange = { startDate: '2026-01-01', endDate: 'yesterday' };
+    
+    const req1 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'sessionCampaignName' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'totalRevenue' },
+            { name: 'bounceRate' },
+            { name: 'averageSessionDuration' },
+            { name: 'engagedSessions' }
+        ],
+        limit: 200
+    });
+    
+    const req2 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'sessionSourceMedium' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'bounceRate' },
+            { name: 'totalRevenue' }
+        ],
+        limit: 15
+    });
+    
+    const req3 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'isoWeek' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'engagedSessions' }
+        ],
+        orderBys: [{ dimension: { dimensionName: 'isoWeek' } }]
+    });
+    
+    const req4 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'deviceCategory' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'bounceRate' }
+        ]
+    });
+    
+    const req5 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'country' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'totalRevenue' }
+        ],
+        limit: 15
+    });
+    
+    const req6 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'newVsReturning' }],
+        metrics: [
+            { name: 'sessions' },
+            { name: 'conversions' },
+            { name: 'totalRevenue' }
+        ]
+    });
+    
+    const req7 = ga4Report({
+        dateRanges: [dateRange],
+        dimensions: [{ name: 'eventName' }],
+        metrics: [{ name: 'eventCount' }],
+        limit: 20
+    });
+    
+    return Promise.allSettled([req1, req2, req3, req4, req5, req6, req7]);
+};
+
+window.ga4ProcessAll = function(results) {
+    if (!window.EMINZA.campaigns) window.EMINZA.campaigns = [];
+    
+    const getVal = (row, i) => parseFloat(row.metricValues[i].value) || 0;
+    const getStr = (row, i) => row.dimensionValues[i].value;
+    
+    const campsRes = results[0].status === 'fulfilled' ? results[0].value : null;
+    const ga4Camps = [];
+    if (campsRes && campsRes.rows) {
+        campsRes.rows.forEach(row => {
+            const name = getStr(row, 0);
+            const sessions = getVal(row, 0);
+            const conversions = getVal(row, 1);
+            const revenue = getVal(row, 2);
+            const bounceRate = getVal(row, 3);
+            const avgDuration = getVal(row, 4);
+            const engagedSessions = getVal(row, 5);
+            
+            const cvr = sessions > 0 ? conversions / sessions : 0;
+            const qScore = Math.min(1, Math.max(0, 
+                ((sessions > 0 ? engagedSessions/sessions : 0) * 0.35) + 
+                ((1 - bounceRate) * 0.35) + 
+                (Math.min(avgDuration / 180, 1) * 0.30)
+            ));
+            
+            let ga4Roas = 0;
+            let attributionGap = 0;
+            
+            const emCamp = window.EMINZA.campaigns.find(c => c.name.toLowerCase() === name.toLowerCase());
+            if (emCamp && emCamp.cost > 0) {
+                ga4Roas = revenue / emCamp.cost;
+                attributionGap = (emCamp.convValue - revenue) / Math.max(emCamp.convValue, 1);
+            }
+            
+            ga4Camps.push({
+                name, sessions, cvr, revenue, bounceRate, avgDuration, qualityScore: qScore, ga4Roas, attributionGap,
+                adsCamp: emCamp || null
+            });
+        });
+    }
+    window.EMINZA.ga4.campaigns = ga4Camps;
+    
+    const srcRes = results[1].status === 'fulfilled' ? results[1].value : null;
+    const sources = [];
+    if (srcRes && srcRes.rows) {
+        srcRes.rows.forEach(row => {
+            const source = getStr(row, 0);
+            const sessions = getVal(row, 0);
+            const conversions = getVal(row, 1);
+            const bounceRate = getVal(row, 2);
+            const revenue = getVal(row, 3);
+            sources.push({
+                source, sessions, cvr: sessions > 0 ? conversions/sessions : 0, bounceRate, revenue
+            });
+        });
+    }
+    window.EMINZA.ga4.sources = sources;
+    
+    const weekRes = results[2].status === 'fulfilled' ? results[2].value : null;
+    const weekly = [];
+    if (weekRes && weekRes.rows) {
+        weekRes.rows.forEach(row => {
+            weekly.push({
+                week: getStr(row, 0),
+                sessions: getVal(row, 0),
+                conversions: getVal(row, 1),
+                engagedSessions: getVal(row, 2)
+            });
+        });
+    }
+    window.EMINZA.ga4.weekly = weekly;
+    
+    const devRes = results[3].status === 'fulfilled' ? results[3].value : null;
+    const devices = [];
+    let totDevSess = 0;
+    if (devRes && devRes.rows) {
+        devRes.rows.forEach(row => totDevSess += getVal(row, 0));
+        devRes.rows.forEach(row => {
+            const sessions = getVal(row, 0);
+            devices.push({
+                device: getStr(row, 0),
+                sessions: sessions,
+                cvr: sessions > 0 ? getVal(row, 1)/sessions : 0,
+                bounceRate: getVal(row, 2),
+                share: totDevSess > 0 ? sessions / totDevSess : 0
+            });
+        });
+    }
+    window.EMINZA.ga4.devices = devices;
+    
+    const ctrRes = results[4].status === 'fulfilled' ? results[4].value : null;
+    const countries = [];
+    if (ctrRes && ctrRes.rows) {
+        ctrRes.rows.forEach(row => {
+            countries.push({
+                country: getStr(row, 0),
+                sessions: getVal(row, 0),
+                cvr: getVal(row, 0) > 0 ? getVal(row, 1)/getVal(row, 0) : 0,
+                revenue: getVal(row, 2)
+            });
+        });
+    }
+    window.EMINZA.ga4.countries = countries;
+    
+    const nvrRes = results[5].status === 'fulfilled' ? results[5].value : null;
+    const nvr = { new: {sessions:0, cvr:0, revenue:0}, returning: {sessions:0, cvr:0, revenue:0} };
+    let totNVRSess = 0;
+    if (nvrRes && nvrRes.rows) {
+        nvrRes.rows.forEach(row => {
+            const type = getStr(row, 0).toLowerCase();
+            const sess = getVal(row, 0);
+            const conv = getVal(row, 1);
+            const rev = getVal(row, 2);
+            totNVRSess += sess;
+            if (type.includes('new')) {
+                nvr.new.sessions = sess;
+                nvr.new.cvr = sess > 0 ? conv/sess : 0;
+                nvr.new.revenue = rev;
+            } else if (type.includes('returning')) {
+                nvr.returning.sessions = sess;
+                nvr.returning.cvr = sess > 0 ? conv/sess : 0;
+                nvr.returning.revenue = rev;
+            }
+        });
+    }
+    window.EMINZA.ga4.newVsReturning = nvr;
+    window.EMINZA.ga4.returningShare = totNVRSess > 0 ? nvr.returning.sessions / totNVRSess : 0;
+    window.EMINZA.ga4.impliedIncrementalLift = nvr.returning.cvr > 0 ? ((nvr.new.cvr - nvr.returning.cvr) / Math.max(nvr.returning.cvr, 0.0001)) * 100 : 0;
+    
+    const byTier = {};
+    const byMarket = {};
+    
+    ga4Camps.forEach(c => {
+        if (!c.adsCamp) return; 
+        const t = c.adsCamp.tier || 'Unknown';
+        const m = c.adsCamp.market || 'Unknown';
+        
+        if (!byTier[t]) byTier[t] = { sessions:0, cvrSum:0, cvrCount:0, revenue:0, qsSum:0, gapSum:0, gapCount:0, adsCost:0, adsRev:0 };
+        byTier[t].sessions += c.sessions;
+        byTier[t].revenue += c.revenue;
+        if (c.sessions > 0) {
+            byTier[t].cvrSum += c.cvr;
+            byTier[t].cvrCount++;
+            byTier[t].qsSum += c.qualityScore;
+        }
+        byTier[t].gapSum += c.attributionGap;
+        byTier[t].gapCount++;
+        byTier[t].adsCost += c.adsCamp.cost;
+        byTier[t].adsRev += c.adsCamp.convValue;
+        
+        if (!byMarket[m]) byMarket[m] = { sessions:0, cvrSum:0, cvrCount:0, revenue:0, qsSum:0 };
+        byMarket[m].sessions += c.sessions;
+        byMarket[m].revenue += c.revenue;
+        if (c.sessions > 0) {
+            byMarket[m].cvrSum += c.cvr;
+            byMarket[m].cvrCount++;
+            byMarket[m].qsSum += c.qualityScore;
+        }
+    });
+    
+    Object.keys(byTier).forEach(t => {
+        byTier[t].cvr = byTier[t].cvrCount > 0 ? byTier[t].cvrSum / byTier[t].cvrCount : 0;
+        byTier[t].qualityScore = byTier[t].cvrCount > 0 ? byTier[t].qsSum / byTier[t].cvrCount : 0;
+        byTier[t].attributionGap = byTier[t].gapCount > 0 ? byTier[t].gapSum / byTier[t].gapCount : 0;
+        byTier[t].ga4Roas = byTier[t].adsCost > 0 ? byTier[t].revenue / byTier[t].adsCost : 0;
+        byTier[t].adsRoas = byTier[t].adsCost > 0 ? byTier[t].adsRev / byTier[t].adsCost : 0;
+    });
+    Object.keys(byMarket).forEach(m => {
+        byMarket[m].cvr = byMarket[m].cvrCount > 0 ? byMarket[m].cvrSum / byMarket[m].cvrCount : 0;
+        byMarket[m].qualityScore = byMarket[m].cvrCount > 0 ? byMarket[m].qsSum / byMarket[m].cvrCount : 0;
+    });
+    
+    window.EMINZA.ga4.byTier = byTier;
+    window.EMINZA.ga4.byMarket = byMarket;
+    
+    window.EMINZA.ga4.ready = true;
+    window.EMINZA.ga4.lastFetched = new Date();
+    window.dispatchEvent(new CustomEvent('ga4ready'));
+};
+
+window.ga4BootConnect = async function() {
+    if (window.ga4IsConnected()) {
+        window.ga4LoadAll().then(res => {
+            window.ga4ProcessAll(res);
+        }).catch(err => {
+            console.error("Background GA4 load failed:", err);
+            window.EMINZA.ga4.ready = false;
+        });
+    } else if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+        const client = window.google.accounts.oauth2.initTokenClient({
+            client_id: GA4_CLIENT_ID,
+            scope: GA4_SCOPE,
+            callback: function(response) {
+                if (response.error) return;
+                sessionStorage.setItem('eminza_ga4_token', JSON.stringify({
+                    access_token: response.access_token,
+                    expires_at: Date.now() + (response.expires_in * 1000)
+                }));
+                window.ga4LoadAll().then(res => window.ga4ProcessAll(res));
+            }
+        });
+        try {
+            client.requestAccessToken({ prompt: '' });
+        } catch(e) {}
+    }
+};
+
+window.renderGA4 = function() {
+    if (!window.ga4IsConnected() || !window.EMINZA.ga4.ready) {
+        let h = '<div style="padding: 40px; text-align: center;">';
+        h += '<h2>Connect Google Analytics 4</h2>';
+        h += '<p>Link your GA4 property to view attribution reality checks and traffic quality scores.</p>';
+        h += '<button style="background:var(--gold);color:#000;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin-top:20px;" onclick="window.ga4Connect(function(){ window.ga4LoadAll().then(r => { window.ga4ProcessAll(r); window.renderGA4(); }) })">Connect GA4</button>';
+        h += '</div>';
+        if (window.setMain) window.setMain(h);
+        return;
+    }
+    
+    const d = window.EMINZA.ga4;
+    const fmt = window.fmt || (x => x);
+    const FM = window.FM || (x => x);
+    const tierBadge = window.tierBadge || (x => '<span>' + x + '</span>');
+    const roasColor = window.roasColor || (x => 'var(--muted)');
+    
+    let totSess = 0;
+    d.sources.forEach(s => totSess += s.sessions);
+    
+    let paidSrc = d.sources.filter(s => s.source.toLowerCase().includes('google') && s.source.toLowerCase().includes('cpc'));
+    let trueCvr = paidSrc.length > 0 ? paidSrc.reduce((sum, s) => sum + s.cvr * s.sessions, 0) / paidSrc.reduce((sum, s) => sum + s.sessions, 0) : 0;
+    if (paidSrc.length === 0) trueCvr = 0;
+    
+    let totalGa4Rev = 0;
+    let totalAdsRev = 0;
+    d.campaigns.forEach(c => {
+        if (c.adsCamp) {
+            totalGa4Rev += c.revenue;
+            totalAdsRev += c.adsCamp.convValue;
+        }
+    });
+    
+    let overallGap = totalAdsRev > 0 ? ((totalAdsRev - totalGa4Rev) / totalAdsRev) * 100 : 0;
+    
+    let alertColor = overallGap > 30 ? 'var(--danger)' : (overallGap > 10 ? 'var(--warning)' : 'var(--success)');
+    let alertMsg = overallGap > 30 ? 'Significant over-attribution detected. Budget Lab recommendations should use GA4 Corrected Mode.' : 
+                  (overallGap > 10 ? 'Moderate attribution gap. Review overclaimed campaigns below.' : 
+                                     'Attribution looks healthy. Google Ads and GA4 are broadly aligned.');
+    
+    let h = '<h2>GA4 Intelligence Dashboard</h2>';
+    
+    h += '<div style="display:flex;gap:15px;margin-bottom:20px;">';
+    h += '<div class="card" style="flex:1;"><h4>GA4 Sessions</h4><h2>' + fmt(totSess) + '</h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>True Paid CVR</h4><h2>' + (trueCvr*100).toFixed(2) + '%</h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>Revenue (GA4 vs Ads)</h4><h2>' + FM(totalGa4Rev) + ' <span style="font-size:0.5em;color:var(--muted)">vs ' + FM(totalAdsRev) + '</span></h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>Overall Gap</h4><h2 style="color:' + alertColor + '">' + overallGap.toFixed(1) + '%</h2></div>';
+    h += '</div>';
+    
+    h += '<div style="background:' + alertColor + '20; color:' + alertColor + '; padding:15px; border-left: 4px solid ' + alertColor + '; margin-bottom:20px;">' + alertMsg + '</div>';
+    
+    h += '<h3>Attribution Gap by Tier</h3>';
+    h += '<table class="table" style="width:100%;margin-bottom:30px;"><thead><tr><th>Tier</th><th>Ads ROAS</th><th>GA4 ROAS</th><th>Gap %</th><th>Quality Score</th><th>Status</th></tr></thead><tbody>';
+    Object.keys(d.byTier).forEach(t => {
+        let tr = d.byTier[t];
+        let gap = tr.attributionGap * 100;
+        let status = gap > 20 ? 'Overclaimed' : (gap > 5 ? 'Inflated' : 'Aligned');
+        let col = gap > 20 ? 'var(--danger)' : (gap > 5 ? 'var(--warning)' : 'var(--success)');
+        h += '<tr>';
+        h += '<td>' + tierBadge(t) + '</td>';
+        h += '<td style="color:' + roasColor(tr.adsRoas) + '">' + tr.adsRoas.toFixed(2) + '</td>';
+        h += '<td style="color:' + roasColor(tr.ga4Roas) + '">' + tr.ga4Roas.toFixed(2) + '</td>';
+        h += '<td style="color:' + col + '">' + gap.toFixed(1) + '%</td>';
+        h += '<td>' + (tr.qualityScore * 10).toFixed(1) + '/10</td>';
+        h += '<td style="color:' + col + '">' + status + '</td>';
+        h += '</tr>';
+    });
+    h += '</tbody></table>';
+    
+    let sortedCamps = [...d.campaigns].sort((a,b) => b.qualityScore - a.qualityScore);
+    let top10 = sortedCamps.slice(0, 10);
+    let bot10 = sortedCamps.slice(-10).reverse();
+    
+    h += '<div style="display:flex;gap:20px;margin-bottom:30px;">';
+    h += '<div style="flex:1;"><h3>Top 10 Quality</h3><table class="table" style="width:100%;font-size:0.9em;"><thead><tr><th>Campaign</th><th>QS</th></tr></thead><tbody>';
+    top10.forEach(c => {
+        h += '<tr><td>' + (c.adsCamp ? tierBadge(c.adsCamp.tier) : '') + ' ' + c.name + '</td><td style="color:var(--success)">' + (c.qualityScore*10).toFixed(1) + '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+    
+    h += '<div style="flex:1;"><h3>Bottom 10 Quality</h3><table class="table" style="width:100%;font-size:0.9em;"><thead><tr><th>Campaign</th><th>QS</th></tr></thead><tbody>';
+    bot10.forEach(c => {
+        h += '<tr><td>' + (c.adsCamp ? tierBadge(c.adsCamp.tier) : '') + ' ' + c.name + '</td><td style="color:var(--danger)">' + (c.qualityScore*10).toFixed(1) + '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+    h += '</div>';
+    
+    h += '<h3>Weekly Sessions</h3>';
+    h += '<div id="ga4-weekly-chart" style="height:300px;background:var(--card-bg);margin-bottom:30px;padding:15px;text-align:center;color:var(--muted)"></div>';
+    
+    h += '<h3>Top Traffic Sources</h3>';
+    h += '<table class="table" style="width:100%;margin-bottom:30px;"><thead><tr><th>Source / Medium</th><th>Sessions</th><th>CVR</th><th>Bounce Rate</th><th>Revenue</th></tr></thead><tbody>';
+    d.sources.slice(0, 10).forEach(s => {
+        let cvrCol = s.cvr > 0.02 ? 'var(--success)' : (s.cvr < 0.005 ? 'var(--danger)' : 'var(--warning)');
+        h += '<tr>';
+        h += '<td>' + s.source + '</td>';
+        h += '<td>' + fmt(s.sessions) + '</td>';
+        h += '<td style="color:' + cvrCol + '">' + (s.cvr*100).toFixed(2) + '%</td>';
+        h += '<td>' + (s.bounceRate*100).toFixed(1) + '%</td>';
+        h += '<td>' + FM(s.revenue) + '</td>';
+        h += '</tr>';
+    });
+    h += '</tbody></table>';
+    
+    h += '<div style="display:flex;gap:20px;margin-bottom:30px;">';
+    h += '<div class="card" style="flex:1;"><h3>Device Split</h3>';
+    let mob = d.devices.find(x => x.device.toLowerCase().includes('mobile'));
+    let desk = d.devices.find(x => x.device.toLowerCase().includes('desktop'));
+    d.devices.forEach(dev => {
+        h += '<div><b>' + dev.device + '</b>: ' + (dev.share*100).toFixed(1) + '% (CVR: ' + (dev.cvr*100).toFixed(2) + '%)</div>';
+    });
+    if (mob && desk && mob.cvr < desk.cvr * 0.5) {
+        h += '<div style="color:var(--danger);margin-top:10px;">⚠️ Mobile CVR is critically low compared to Desktop.</div>';
+    }
+    h += '</div>';
+    
+    h += '<div class="card" style="flex:1;"><h3>New vs Returning</h3>';
+    h += '<div><b>New CVR:</b> ' + (d.newVsReturning.new.cvr*100).toFixed(2) + '%</div>';
+    h += '<div><b>Returning CVR:</b> ' + (d.newVsReturning.returning.cvr*100).toFixed(2) + '%</div>';
+    h += '<div><b>Implied Lift:</b> <span style="color:' + (d.impliedIncrementalLift>0?'var(--success)':'var(--danger)') + '">' + d.impliedIncrementalLift.toFixed(1) + '%</span></div>';
+    h += '</div>';
+    
+    h += '</div>';
+    
+    if (window.setMain) {
+        window.setMain(h);
+        
+        if (window.makeChart) {
+            let labels = d.weekly.map(w => w.week);
+            let sessData = d.weekly.map(w => w.sessions);
+            let cvrData = d.weekly.map(w => w.sessions > 0 ? (w.conversions/w.sessions)*100 : 0);
+            try {
+                window.makeChart(document.getElementById('ga4-weekly-chart'), {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            { label: 'Sessions', data: sessData, yAxisID: 'y' },
+                            { label: 'CVR %', data: cvrData, yAxisID: 'y1' }
+                        ]
+                    }
+                });
+            } catch(e) {}
+        }
+    }
+};
+
+
+// --- attribution_intelligence.js ---
+window.renderAttributionIntelligence = function() {
+    if (!window.ga4IsConnected || !window.ga4IsConnected() || !window.EMINZA || !window.EMINZA.ga4 || !window.EMINZA.ga4.ready) {
+        let h = '<div style="padding: 40px; text-align: center;">';
+        h += '<h2>Attribution Intelligence Requires GA4</h2>';
+        h += '<p>Please connect Google Analytics 4 to view attribution insights.</p>';
+        h += '<button style="background:var(--gold);color:#000;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin-top:20px;" onclick="if(window.renderGA4) window.renderGA4();">Go to GA4 Setup</button>';
+        h += '</div>';
+        if (window.setMain) window.setMain(h);
+        return;
+    }
+    
+    const d = window.EMINZA.ga4;
+    const fm = window.FM || (x => x);
+    const fmt = window.fmt || (x => x);
+    const tierBadge = window.tierBadge || (x => '<span>' + x + '</span>');
+    
+    let totalAdsRev = 0;
+    let totalGa4Rev = 0;
+    let overclaimedCount = 0;
+    
+    let rowsHTML = '';
+    let hasUnmatched = false;
+    
+    const campaignsToRender = d.campaigns.filter(c => c.adsCamp && c.adsCamp.cost > 0);
+    if (d.campaigns.length > 0 && campaignsToRender.length === 0) hasUnmatched = true;
+    
+    campaignsToRender.sort((a, b) => b.attributionGap - a.attributionGap).forEach(c => {
+        let adsRev = c.adsCamp.convValue || 0;
+        let ga4Rev = c.revenue || 0;
+        
+        totalAdsRev += adsRev;
+        totalGa4Rev += ga4Rev;
+        
+        let gapPct = c.attributionGap * 100;
+        let gapVal = adsRev - ga4Rev;
+        
+        let verdict = '';
+        let vColor = '';
+        if (ga4Rev === 0) {
+            verdict = '? No GA4 data';
+            vColor = 'var(--muted)';
+        } else if (gapPct > 20) {
+            verdict = '🚨 Overclaimed';
+            vColor = 'var(--danger)';
+            overclaimedCount++;
+        } else if (gapPct > 5) {
+            verdict = '⚠ Inflated';
+            vColor = 'var(--warning)';
+        } else {
+            verdict = '✓ Aligned';
+            vColor = 'var(--success)';
+        }
+        
+        let displayRow = gapPct > 10 || ga4Rev === 0;
+        
+        rowsHTML += '<tr class="' + (displayRow ? 'misaligned-row' : 'aligned-row') + '" style="' + (!displayRow ? 'display:none;' : '') + '">';
+        rowsHTML += '<td>' + c.name + '</td>';
+        rowsHTML += '<td>' + tierBadge(c.adsCamp.tier) + '</td>';
+        rowsHTML += '<td>' + fm(adsRev) + '</td>';
+        rowsHTML += '<td>' + fm(ga4Rev) + '</td>';
+        rowsHTML += '<td style="color:' + (gapVal > 0 ? 'var(--danger)' : 'var(--success)') + '">' + fm(gapVal) + '</td>';
+        rowsHTML += '<td style="color:' + vColor + '">' + gapPct.toFixed(1) + '%</td>';
+        rowsHTML += '<td>' + (c.qualityScore * 10).toFixed(1) + '/10</td>';
+        rowsHTML += '<td style="color:' + vColor + '; font-weight:bold;">' + verdict + '</td>';
+        rowsHTML += '</tr>';
+    });
+    
+    let overallGapVal = totalAdsRev - totalGa4Rev;
+    let overallGapPct = totalAdsRev > 0 ? (overallGapVal / totalAdsRev) * 100 : 0;
+    
+    let h = '<h2>Attribution Intelligence</h2>';
+    
+    h += '<div style="display:flex;gap:15px;margin-bottom:20px;">';
+    h += '<div class="card" style="flex:1;"><h4>Total Ads Attributed Rev</h4><h2>' + fm(totalAdsRev) + '</h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>Total GA4 Revenue</h4><h2>' + fm(totalGa4Rev) + '</h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>Overall Gap</h4><h2 style="color:' + (overallGapPct > 10 ? 'var(--danger)' : 'var(--success)') + '">' + fm(overallGapVal) + ' (' + overallGapPct.toFixed(1) + '%)</h2></div>';
+    h += '<div class="card" style="flex:1;"><h4>Overclaimed Campaigns</h4><h2 style="color:var(--danger)">' + overclaimedCount + '</h2></div>';
+    h += '</div>';
+    
+    let worstTier = null;
+    let worstGap = -1;
+    let bestTier = null;
+    let bestGa4Roas = -1;
+    
+    Object.keys(d.byTier).forEach(t => {
+        let tr = d.byTier[t];
+        if (tr.attributionGap > worstGap && tr.adsCost > 100) {
+            worstGap = tr.attributionGap;
+            worstTier = t;
+        }
+        if (tr.ga4Roas > bestGa4Roas && tr.adsCost > 100) {
+            bestGa4Roas = tr.ga4Roas;
+            bestTier = t;
+        }
+    });
+    
+    if (worstTier && bestTier && worstTier !== bestTier && worstGap > 0.2) {
+        let wastedSpend = d.byTier[worstTier].adsCost * worstGap;
+        h += '<div style="background:var(--warning)20; color:var(--warning); padding:15px; border-left:4px solid var(--warning); margin-bottom:20px; font-weight:bold;">';
+        h += 'Budget Implication: If you corrected for the ' + (worstGap*100).toFixed(0) + '% attribution gap in ' + worstTier + ', you could reallocate ' + fm(wastedSpend) + ' to ' + bestTier + ' (which has better True ROAS).';
+        h += '</div>';
+    }
+    
+    h += '<div style="display:flex;gap:10px;margin-bottom:30px;flex-wrap:wrap;">';
+    Object.keys(d.byTier).forEach(t => {
+        let tr = d.byTier[t];
+        let gap = tr.attributionGap * 100;
+        let c = gap > 20 ? 'var(--danger)' : (gap > 5 ? 'var(--warning)' : 'var(--success)');
+        h += '<div class="card" style="flex:1;min-width:200px;border-top:3px solid ' + c + '">';
+        h += '<h4>' + tierBadge(t) + '</h4>';
+        h += '<div style="display:flex;justify-content:space-between;margin-top:10px;"><span>Ads ROAS:</span> <b>' + tr.adsRoas.toFixed(2) + '</b></div>';
+        h += '<div style="display:flex;justify-content:space-between;"><span>GA4 ROAS:</span> <b>' + tr.ga4Roas.toFixed(2) + '</b></div>';
+        h += '<div style="display:flex;justify-content:space-between;margin-top:10px;color:' + c + '"><span>Gap:</span> <b>' + gap.toFixed(1) + '%</b></div>';
+        h += '</div>';
+    });
+    h += '</div>';
+    
+    if (hasUnmatched) {
+        h += '<div style="margin-bottom:20px;font-size:0.9em;color:var(--muted)">Note: Some campaigns could not be matched. Please ensure UTM parameters match your Google Ads campaign names exactly.</div>';
+    }
+    
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;">';
+    h += '<h3>Campaign Attribution Audit</h3>';
+    h += '<button onclick="document.querySelectorAll(\'.aligned-row\').forEach(e=>e.style.display=e.style.display===\'none\'?\'table-row\':\'none\')" style="padding:5px 10px;cursor:pointer;">Toggle Aligned Campaigns</button>';
+    h += '</div>';
+    
+    h += '<table class="table" style="width:100%;"><thead><tr>';
+    h += '<th>Campaign</th><th>Tier</th><th>Ads Conv Value</th><th>GA4 Revenue</th><th>Gap €</th><th>Gap %</th><th>Quality Score</th><th>Verdict</th>';
+    h += '</tr></thead><tbody>';
+    h += rowsHTML;
+    h += '</tbody></table>';
+    
+    if (window.setMain) window.setMain(h);
+};
+
+
+// --- audience_intelligence.js ---
+window.renderAudienceIntelligence = function() {
+  if (!window.EMINZA.ga4?.ready) {
+    setMain(`
+      <div class="card" style="text-align:center;padding:3rem 1rem;">
+        <h2 style="margin-bottom:1rem;">GA4 Integration Required</h2>
+        <p style="color:var(--muted);margin-bottom:2rem;">Connect Google Analytics to unlock Audience Intelligence.</p>
+        <button onclick="ga4Connect(() => window.navigate('audience'))" style="background:var(--gold);color:#000;border:none;padding:0.75rem 1.5rem;border-radius:6px;cursor:pointer;font-weight:700;">
+          Connect Google Analytics to unlock Audience Intelligence
+        </button>
+      </div>
+    `);
+    return;
   }
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(err.error?.message || `HTTP ${r.status}`);
+
+  const ga4 = window.EMINZA.ga4 || {};
+  const lift = ga4.impliedIncrementalLift || 0;
+  
+  let liftColor = 'var(--danger)';
+  if (lift > 30) liftColor = 'var(--success)';
+  else if (lift >= 10) liftColor = 'var(--warning)';
+
+  const n = ga4.newVsReturning?.new || {};
+  const r = ga4.newVsReturning?.returning || {};
+
+  const byTier = ga4.byTier || {};
+  const byMarket = ga4.byMarket || {};
+  const camps = window.EMINZA.campaigns || [];
+
+  // Group camps by tier and market for table lookups
+  const tierSpends = {};
+  const marketRoas = {};
+  camps.forEach(c => {
+    if (c.tier) {
+      tierSpends[c.tier] = (tierSpends[c.tier] || 0) + (c.cost || 0);
+    }
+    if (c.market) {
+      if (!marketRoas[c.market]) marketRoas[c.market] = { cost: 0, rev: 0 };
+      marketRoas[c.market].cost += (c.cost || 0);
+      marketRoas[c.market].rev += (c.convValue || 0);
+    }
+  });
+  
+  const zTier = byTier['ZOMBIE'];
+  let zombieHtml = '';
+  if (zTier) {
+    const zsShare = (zTier.returningShare || 0) * 100;
+    const zQs = zTier.qualityScore || 0;
+    const zLift = ga4.impliedIncrementalLift || 0;
+    const zAssumed = (window._incFactors && window._incFactors['ZOMBIE']) ? window._incFactors['ZOMBIE'] * 100 : 25;
+    
+    let verdict = '✓ ZOMBIE metrics within acceptable range. Continue monitoring.';
+    if (zsShare > 60) {
+      verdict = '⚠ High returning user concentration. ZOMBIE campaigns likely serving existing customers. True incremental lift may be lower than assumed.';
+    } else if (zLift < 15) {
+      verdict = '🚨 GA4 data suggests very low incrementality for ZOMBIE tier. Consider pausing and running a formal holdout test.';
+    }
+    
+    zombieHtml = `
+      <div style="background:rgba(201,168,76,0.1);border:1px solid var(--gold);border-radius:8px;padding:1rem;margin-bottom:1rem;">
+        <h3 style="margin-top:0;color:var(--gold);">🧟 ZOMBIE Campaign Diagnosis</h3>
+        <ul style="margin:0.5rem 0;padding-left:1.5rem;font-size:0.85rem;color:var(--muted);">
+          <li>Returning user share: ${zsShare.toFixed(1)}%</li>
+          <li>GA4 Quality Score: ${zQs.toFixed(2)}</li>
+          <li>Implied incremental lift: ${zLift.toFixed(1)}%</li>
+          <li>Current incremental assumption in sim: ${zAssumed.toFixed(1)}% (from window._incFactors if available)</li>
+        </ul>
+        <p style="font-size:0.85rem;margin-bottom:1rem;font-weight:600;">Verdict based on data:<br/><span style="font-weight:400;">${verdict}</span></p>
+        <button onclick="window._applyGA4Lift?.(); window.navigate('incrementality');" style="background:var(--gold);color:#000;border:none;padding:0.5rem 1rem;border-radius:4px;cursor:pointer;font-weight:600;font-size:0.8rem;">
+          Apply GA4 Lift to Incrementality Sim
+        </button>
+      </div>
+    `;
   }
-  return r.json();
-}
 
-async function ga4LoadAll() {
-  // 1. Overview KPIs — YTD
-  const overview = await ga4Report({
-    dateRanges: [{ startDate: '2026-01-01', endDate: 'today' }],
-    metrics: [
-      { name: 'sessions' },
-      { name: 'engagedSessions' },
-      { name: 'bounceRate' },
-      { name: 'conversions' },
-      { name: 'totalRevenue' },
-      { name: 'newUsers' },
-      { name: 'averageSessionDuration' }
-    ]
-  });
+  // Tier Incrementality Risk Matrix
+  const tierHtml = Object.keys(byTier).map(t => {
+    const tier = byTier[t] || {};
+    const rShare = (tier.returningShare || 0) * 100;
+    const qs = tier.qualityScore || 0;
+    const spend = tierSpends[t] || 0;
+    const sess = tier.sessions || 0;
+    const cvr = tier.cvr || 0;
 
-  // 2. Weekly trend
-  const weekly = await ga4Report({
-    dateRanges: [{ startDate: '2026-01-01', endDate: 'today' }],
-    metrics: [
-      { name: 'sessions' },
-      { name: 'conversions' },
-      { name: 'engagedSessions' }
-    ],
-    dimensions: [{ name: 'isoWeek' }],
-    orderBys: [{ dimension: { dimensionName: 'isoWeek' } }]
-  });
+    let risk = 'LOW';
+    let riskColor = 'var(--success)';
+    let rec = 'Healthy incrementality — maintain or scale';
 
-  // 3. Source / Medium
-  const sources = await ga4Report({
-    dateRanges: [{ startDate: '2026-01-01', endDate: 'today' }],
-    metrics: [
-      { name: 'sessions' },
-      { name: 'conversions' },
-      { name: 'bounceRate' },
-      { name: 'totalRevenue' }
-    ],
-    dimensions: [{ name: 'sessionSourceMedium' }],
-    orderBys: [{ metric: { metricName: 'sessions' }, desc: true }],
-    limit: 12
-  });
+    if (rShare > 65 || qs < 0.35) {
+      risk = 'HIGH';
+      riskColor = 'var(--danger)';
+      rec = 'Reduce budget or run geo holdout test';
+    } else if (rShare >= 40 || (qs >= 0.35 && qs <= 0.55)) {
+      risk = 'MEDIUM';
+      riskColor = 'var(--warning)';
+      rec = 'Monitor — consider holdout validation';
+    }
 
-  // 4. Device category
-  const devices = await ga4Report({
-    dateRanges: [{ startDate: '2026-01-01', endDate: 'today' }],
-    metrics: [{ name: 'sessions' }, { name: 'conversions' }, { name: 'bounceRate' }],
-    dimensions: [{ name: 'deviceCategory' }],
-    orderBys: [{ metric: { metricName: 'sessions' }, desc: true }]
-  });
-
-  // 5. Top countries
-  const countries = await ga4Report({
-    dateRanges: [{ startDate: '2026-01-01', endDate: 'today' }],
-    metrics: [{ name: 'sessions' }, { name: 'conversions' }, { name: 'totalRevenue' }],
-    dimensions: [{ name: 'country' }],
-    orderBys: [{ metric: { metricName: 'sessions' }, desc: true }],
-    limit: 10
-  });
-
-  return { overview, weekly, sources, devices, countries };
-}
-
-// ── Helpers ──────────────────────────────────────────────────
-const _gm  = (row, i) => parseFloat(row.metricValues?.[i]?.value  || '0');
-const _gd  = (row, i) => row.dimensionValues?.[i]?.value || '';
-const fmtDur = s => { const m = Math.floor(s/60); const sec = Math.round(s%60); return `${m}m ${sec}s`; };
-const cvrColor = v => v >= 2 ? 'var(--success)' : v >= 1 ? 'var(--warning)' : 'var(--danger)';
-const brColor  = v => v < 0.4 ? 'var(--success)' : v < 0.65 ? 'var(--warning)' : 'var(--danger)';
-
-// ── Login screen ─────────────────────────────────────────────
-function renderGA4Login() {
-  setMain(`
-    <div class="section-header">
-      <div class="breadcrumb">Intelligence</div>
-      <h2>GA4 Analytics</h2>
-    </div>
-    <div class="card" style="max-width:480px;margin:3rem auto;text-align:center;padding:2.5rem 2rem">
-      <div style="font-size:3rem;margin-bottom:0.75rem">📊</div>
-      <h3 style="margin-bottom:0.5rem;font-size:1.1rem">Google Analytics 4</h3>
-      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0.25rem">Property ID: <code style="background:var(--surface);padding:0.15rem 0.4rem;border-radius:4px">${GA4_PROPERTY}</code></p>
-      <p style="color:var(--muted);font-size:0.82rem;margin-bottom:1.75rem">
-        Sign in with Google to load live session data, true CVR, bounce rates, source/medium and device breakdown.
-      </p>
-      <button id="ga4-btn" onclick="window._ga4DoConnect()"
-        style="background:var(--gold);color:#000;border:none;padding:0.75rem 2rem;border-radius:8px;font-size:0.95rem;font-weight:700;cursor:pointer;width:100%;max-width:280px">
-        🔐 Connect Google Analytics
-      </button>
-      <p id="ga4-connect-msg" style="font-size:0.76rem;color:var(--muted);margin-top:1rem;min-height:1.2em"></p>
-      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.5rem">
-        Read-only access · No data is stored · Session only
-      </p>
-    </div>
-  `);
-  window._ga4DoConnect = () => {
-    const btn = document.getElementById('ga4-btn');
-    const msg = document.getElementById('ga4-connect-msg');
-    if (btn) btn.textContent = 'Connecting…';
-    ga4Connect(() => window.navigate('ga4'));
-  };
-}
-
-// ── Dashboard ─────────────────────────────────────────────────
-function renderGA4Dashboard(d) {
-  const ov = d.overview.rows?.[0];
-  if (!ov) { setMain('<div class="callout">GA4 returned no data for this property.</div>'); return; }
-
-  const sessions    = _gm(ov, 0);
-  const engaged     = _gm(ov, 1);
-  const bounceRate  = _gm(ov, 2);
-  const conv        = _gm(ov, 3);
-  const revenue     = _gm(ov, 4);
-  const newUsers    = _gm(ov, 5);
-  const avgDur      = _gm(ov, 6);
-  const cvr         = sessions > 0 ? (conv / sessions) * 100 : 0;
-  const engRate     = sessions > 0 ? (engaged / sessions) * 100 : 0;
-
-  const kpi = (label, value, color='', sub='') => `
-    <div class="card kpi-card">
-      <div class="kpi-label">${label}</div>
-      <div class="kpi-value" style="${color ? 'color:'+color : ''}">${value}</div>
-      ${sub ? `<div style="font-size:0.72rem;color:var(--muted);margin-top:0.2rem">${sub}</div>` : ''}
-    </div>`;
-
-  // Sources table
-  const srcRows = (d.sources.rows || []).map(r => {
-    const src  = _gd(r, 0);
-    const s    = _gm(r, 0);
-    const c    = _gm(r, 1);
-    const br   = _gm(r, 2);
-    const rv   = _gm(r, 3);
-    const cv   = s > 0 ? (c / s) * 100 : 0;
     return `<tr>
-      <td style="font-size:0.82rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${src}</td>
-      <td>${s.toLocaleString('en-GB')}</td>
-      <td style="color:${cvrColor(cv)};font-weight:600">${cv.toFixed(2)}%</td>
-      <td style="color:${brColor(br)}">${(br*100).toFixed(1)}%</td>
-      <td>${rv > 0 ? fmt.curK(rv) : '—'}</td>
+      <td>${typeof tierBadge === 'function' ? tierBadge(t) : t}</td>
+      <td style="text-align:right;">${typeof fmt !== 'undefined' && fmt.curK ? fmt.curK(spend) : spend}</td>
+      <td style="text-align:right;">${typeof fmt !== 'undefined' && fmt.num ? fmt.num(sess) : sess}</td>
+      <td style="text-align:right;">${cvr.toFixed(2)}%</td>
+      <td style="text-align:right;">${qs.toFixed(2)}</td>
+      <td style="text-align:right;">${rShare.toFixed(1)}%</td>
+      <td style="color:${riskColor};font-weight:600;text-align:center;">${risk}</td>
+      <td style="font-size:0.8rem;">${rec}</td>
     </tr>`;
   }).join('');
 
-  // Devices table
-  const devRows = (d.devices.rows || []).map(r => {
-    const dev = _gd(r, 0);
-    const s   = _gm(r, 0);
-    const c   = _gm(r, 1);
-    const br  = _gm(r, 2);
-    const cv  = s > 0 ? (c / s) * 100 : 0;
-    const share = sessions > 0 ? (s / sessions) * 100 : 0;
-    return `<tr>
-      <td style="text-transform:capitalize">${dev}</td>
-      <td>${s.toLocaleString('en-GB')}</td>
-      <td>${share.toFixed(1)}%</td>
-      <td style="color:${cvrColor(cv)};font-weight:600">${cv.toFixed(2)}%</td>
-      <td style="color:${brColor(br)}">${(br*100).toFixed(1)}%</td>
-    </tr>`;
+  // Device Journey Intelligence
+  const devs = ga4.devices || [];
+  let mobCvr = 0, deskCvr = 0;
+  const devHtml = devs.map(d => {
+    if (d.deviceCategory === 'mobile') mobCvr = d.cvr || 0;
+    if (d.deviceCategory === 'desktop') deskCvr = d.cvr || 0;
+    return `
+      <div class="card" style="flex:1;">
+        <h4 style="margin:0 0 0.5rem 0;text-transform:capitalize;">${d.deviceCategory || 'Unknown'}</h4>
+        <div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.25rem;">
+          <span style="color:var(--muted)">Sessions:</span> <strong>${typeof fmt !== 'undefined' && fmt.num ? fmt.num(d.sessions||0) : d.sessions||0}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.25rem;">
+          <span style="color:var(--muted)">CVR:</span> <strong>${(d.cvr||0).toFixed(2)}%</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.8rem;">
+          <span style="color:var(--muted)">Bounce Rate:</span> <strong>${(d.bounceRate||0).toFixed(1)}%</strong>
+        </div>
+      </div>
+    `;
   }).join('');
 
-  // Countries table
-  const ctryRows = (d.countries.rows || []).map(r => {
-    const ctry  = _gd(r, 0);
-    const s     = _gm(r, 0);
-    const c     = _gm(r, 1);
-    const rv    = _gm(r, 2);
-    const cv    = s > 0 ? (c / s) * 100 : 0;
-    const share = sessions > 0 ? (s / sessions) * 100 : 0;
+  let devAlertHtml = '';
+  if (mobCvr > 0 && deskCvr > 0 && mobCvr < deskCvr * 0.5) {
+    devAlertHtml = `
+      <div style="background:rgba(239,68,68,0.1);border-left:3px solid var(--danger);padding:0.75rem;margin-bottom:1rem;font-size:0.85rem;color:var(--text);">
+        ⚠ Cross-device journey likely: mobile CVR (${mobCvr.toFixed(2)}%) is less than half desktop CVR (${deskCvr.toFixed(2)}%). Mobile campaigns may be undervalued — users browse on mobile and convert on desktop.
+      </div>
+    `;
+  }
+
+  // Market Quality Map
+  const mktHtml = Object.keys(byMarket).map(m => {
+    const mkt = byMarket[m] || {};
+    const qs = mkt.qualityScore || 0;
+    const mr = marketRoas[m] || {cost:0,rev:0};
+    const adsRoas = mr.cost > 0 ? mr.rev / mr.cost : 0;
+    const beRoas = (typeof FM !== 'undefined' && FM.profitBreakevenRoas) ? FM.profitBreakevenRoas : 1.5;
+
+    let signal = 'Review';
+    let sigColor = 'var(--muted)';
+    
+    if (qs > 0.65 && adsRoas < beRoas) {
+      signal = 'Scale ↑';
+      sigColor = 'var(--success)';
+    } else if (qs < 0.35 && adsRoas > beRoas) {
+      signal = 'Investigate';
+      sigColor = 'var(--warning)';
+    } else if (qs > 0.55 && adsRoas > beRoas) {
+      signal = 'Healthy ✓';
+      sigColor = 'var(--success)';
+    }
+
     return `<tr>
-      <td>${ctry}</td>
-      <td>${s.toLocaleString('en-GB')}</td>
-      <td>${share.toFixed(1)}%</td>
-      <td style="color:${cvrColor(cv)};font-weight:600">${cv.toFixed(2)}%</td>
-      <td>${rv > 0 ? fmt.curK(rv) : '—'}</td>
+      <td>${typeof mktBadge === 'function' ? mktBadge(m) : m}</td>
+      <td style="text-align:right;">${typeof fmt !== 'undefined' && fmt.num ? fmt.num(mkt.sessions||0) : mkt.sessions||0}</td>
+      <td style="text-align:right;">${(mkt.cvr||0).toFixed(2)}%</td>
+      <td style="text-align:right;color:${typeof roasColorCss === 'function' ? roasColorCss(adsRoas) : 'inherit'}">${adsRoas.toFixed(2)}x</td>
+      <td style="text-align:right;">${qs.toFixed(2)}</td>
+      <td style="color:${sigColor};font-weight:600;text-align:center;">${signal}</td>
     </tr>`;
   }).join('');
 
   setMain(`
-    <div class="section-header">
-      <div class="breadcrumb">Intelligence</div>
-      <h2>GA4 Analytics</h2>
-      <p class="section-desc" style="font-size:0.78rem">
-        Property ${GA4_PROPERTY} · YTD 2026 ·
-        <span style="color:var(--success)">● Connected</span> &nbsp;
-        <button onclick="window._ga4Reconnect()" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:0.15rem 0.5rem;border-radius:4px;cursor:pointer;font-size:0.72rem">Reconnect</button>
-      </p>
+    <div style="margin-bottom:1.5rem;">
+      <h1 style="margin:0 0 0.5rem 0;">Audience Intelligence</h1>
+      <p style="color:var(--muted);margin:0;">Deep GA4 integration insights</p>
     </div>
 
-    <!-- KPI row -->
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;margin-bottom:1rem">
-      ${kpi('Sessions',        sessions.toLocaleString('en-GB'))}
-      ${kpi('True CVR',        cvr.toFixed(2)+'%',       cvrColor(cvr), 'GA4 actual')}
-      ${kpi('Engagement Rate', engRate.toFixed(1)+'%',    engRate>=50?'var(--success)':'var(--warning)')}
-      ${kpi('Avg. Duration',   fmtDur(avgDur))}
-      ${kpi('Conversions',     conv.toLocaleString('en-GB'))}
-      ${kpi('New Users',       newUsers.toLocaleString('en-GB'))}
-      ${kpi('Bounce Rate',     (bounceRate*100).toFixed(1)+'%', brColor(bounceRate))}
-      ${kpi('GA4 Revenue',     fmt.curK(revenue), '', 'e-commerce')}
+    <!-- 1. Incrementality Diagnostic (hero) -->
+    <div class="card" style="text-align:center;padding:2rem 1rem;margin-bottom:1.5rem;border-top:4px solid ${liftColor};">
+      <div style="font-size:2.5rem;font-weight:800;color:${liftColor};line-height:1;">
+        ${lift.toFixed(0)}% Implied Incremental Lift
+      </div>
+      <div style="font-size:0.9rem;color:var(--muted);margin-top:0.5rem;max-width:600px;margin-left:auto;margin-right:auto;">
+        Estimated % of conversions driven by ads (new users) vs converting-anyway audience (returning users)
+      </div>
+      <div style="background:var(--surface);padding:0.75rem;border-radius:6px;font-size:0.75rem;color:var(--muted);margin-top:1rem;display:inline-block;text-align:left;max-width:500px;">
+        This is calculated from GA4 new vs returning user CVR differential. A low lift% for a tier suggests ads may be serving an audience that would convert without advertising.
+      </div>
     </div>
 
-    <!-- Weekly chart -->
-    <div class="card" style="margin-bottom:1rem">
-      <div class="card-header">Weekly Sessions &amp; Conversions</div>
-      <div class="chart-wrap h-md" style="position:relative"><canvas id="ga4-weekly"></canvas></div>
+    ${zombieHtml}
+
+    <!-- 2. New vs Returning split -->
+    <div style="display:flex;gap:1rem;margin-bottom:1.5rem;">
+      <div class="card" style="flex:1;">
+        <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:0.5rem;">Incremental demand</div>
+        <h3 style="margin:0 0 1rem 0;color:var(--success);">NEW USERS</h3>
+        <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem;">
+          <span style="color:var(--muted)">Sessions:</span> <strong>${typeof fmt !== 'undefined' && fmt.num ? fmt.num(n.sessions||0) : n.sessions||0}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem;">
+          <span style="color:var(--muted)">CVR:</span> <strong>${(n.cvr||0).toFixed(2)}%</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;">
+          <span style="color:var(--muted)">Revenue:</span> <strong>${typeof fmt !== 'undefined' && fmt.curK ? fmt.curK(n.revenue||0) : n.revenue||0}</strong>
+        </div>
+      </div>
+      <div class="card" style="flex:1;">
+        <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:0.5rem;">Baseline (would convert anyway)</div>
+        <h3 style="margin:0 0 1rem 0;color:var(--warning);">RETURNING USERS</h3>
+        <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem;">
+          <span style="color:var(--muted)">Sessions:</span> <strong>${typeof fmt !== 'undefined' && fmt.num ? fmt.num(r.sessions||0) : r.sessions||0}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem;">
+          <span style="color:var(--muted)">CVR:</span> <strong>${(r.cvr||0).toFixed(2)}%</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;">
+          <span style="color:var(--muted)">Revenue:</span> <strong>${typeof fmt !== 'undefined' && fmt.curK ? fmt.curK(r.revenue||0) : r.revenue||0}</strong>
+        </div>
+      </div>
     </div>
 
-    <!-- Source / Medium -->
-    <div class="card" style="margin-bottom:1rem">
-      <div class="card-header">Source / Medium — Top 12</div>
-      <table class="cockpit-table">
-        <thead><tr><th>Source / Medium</th><th>Sessions</th><th>CVR</th><th>Bounce Rate</th><th>Revenue</th></tr></thead>
-        <tbody>${srcRows}</tbody>
+    <!-- 3. Tier Incrementality Risk Matrix -->
+    <div class="card" style="margin-bottom:1.5rem;">
+      <h3 style="margin-top:0;">Tier Incrementality Risk Matrix</h3>
+      <table class="cockpit-table" style="width:100%;">
+        <thead>
+          <tr>
+            <th style="text-align:left;">TIER</th>
+            <th style="text-align:right;">Ads Spend</th>
+            <th style="text-align:right;">Sessions</th>
+            <th style="text-align:right;">CVR</th>
+            <th style="text-align:right;">Quality Score</th>
+            <th style="text-align:right;">Returning%</th>
+            <th style="text-align:center;">Risk Level</th>
+            <th>Recommendation</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tierHtml}
+        </tbody>
       </table>
     </div>
 
-    <!-- Device + Countries side by side -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
-      <div class="card">
-        <div class="card-header">Device Breakdown</div>
-        <table class="cockpit-table">
-          <thead><tr><th>Device</th><th>Sessions</th><th>Share</th><th>CVR</th><th>Bounce</th></tr></thead>
-          <tbody>${devRows}</tbody>
-        </table>
-      </div>
-      <div class="card">
-        <div class="card-header">Top Countries</div>
-        <table class="cockpit-table">
-          <thead><tr><th>Country</th><th>Sessions</th><th>Share</th><th>CVR</th><th>Revenue</th></tr></thead>
-          <tbody>${ctryRows}</tbody>
-        </table>
+    <!-- 5. Device Journey Intelligence -->
+    <div class="card" style="margin-bottom:1.5rem;">
+      <h3 style="margin-top:0;">Device Journey Intelligence</h3>
+      ${devAlertHtml}
+      <div style="display:flex;gap:1rem;">
+        ${devHtml}
       </div>
     </div>
 
-    <p style="font-size:0.72rem;color:var(--muted);text-align:right">
-      GA4 token valid for ~60 min · Data: ${new Date().toLocaleTimeString()}
-    </p>
-  `);
-
-  window._ga4Reconnect = () => ga4Connect(() => window.navigate('ga4'));
-
-  // Weekly chart
-  setTimeout(() => {
-    const rows = (d.weekly.rows || []).sort((a,b) => _gd(a,0).localeCompare(_gd(b,0)));
-    const labels = rows.map(r => 'W' + _gd(r, 0).slice(-2));
-    makeChart('ga4-weekly', 'bar', labels, [
-      {
-        label: 'Sessions',
-        data: rows.map(r => _gm(r, 0)),
-        backgroundColor: '#3B82F688',
-        borderColor: '#3B82F6',
-        borderWidth: 1,
-        yAxisID: 'y'
-      },
-      {
-        label: 'Conversions',
-        data: rows.map(r => _gm(r, 1)),
-        backgroundColor: '#10B981BB',
-        borderColor: '#10B981',
-        borderWidth: 1,
-        yAxisID: 'y2'
-      }
-    ], {
-      scales: {
-        x:  { ticks: { color: '#8A9BB3' }, grid: { color: 'rgba(255,255,255,0.03)' } },
-        y:  { position: 'left',  ticks: { color: '#8A9BB3' }, grid: { color: 'rgba(255,255,255,0.04)' }, title: { display: true, text: 'Sessions', color: '#8A9BB3' } },
-        y2: { position: 'right', ticks: { color: '#10B981' }, grid: { display: false }, title: { display: true, text: 'Conversions', color: '#10B981' } }
-      },
-      plugins: { legend: { labels: { color: '#8A9BB3', font: { size: 10 }, boxWidth: 10 } } }
-    });
-  }, 100);
-}
-
-// ── Main entry point ──────────────────────────────────────────
-window.renderGA4 = async function() {
-  if (!ga4IsConnected()) {
-    renderGA4Login();
-    return;
-  }
-
-  // Show loading state
-  setMain(`
-    <div class="section-header">
-      <div class="breadcrumb">Intelligence</div>
-      <h2>GA4 Analytics</h2>
-    </div>
-    <div style="text-align:center;padding:4rem;color:var(--muted)">
-      <div style="font-size:2rem;margin-bottom:0.75rem">⏳</div>
-      <p>Loading GA4 data from property ${GA4_PROPERTY}…</p>
+    <!-- 6. Market Quality Map table -->
+    <div class="card">
+      <h3 style="margin-top:0;">Market Quality Map</h3>
+      <table class="cockpit-table" style="width:100%;">
+        <thead>
+          <tr>
+            <th style="text-align:left;">Market badge</th>
+            <th style="text-align:right;">GA4 Sessions</th>
+            <th style="text-align:right;">GA4 CVR</th>
+            <th style="text-align:right;">Ads ROAS</th>
+            <th style="text-align:right;">Quality Score</th>
+            <th style="text-align:center;">Signal</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${mktHtml}
+        </tbody>
+      </table>
     </div>
   `);
-
-  try {
-    const data = await ga4LoadAll();
-    renderGA4Dashboard(data);
-  } catch(e) {
-    console.error('[GA4]', e);
-    const reconnectNeeded = !ga4IsConnected();
-    setMain(`
-      <div class="section-header">
-        <div class="breadcrumb">Intelligence</div>
-        <h2>GA4 Analytics</h2>
-      </div>
-      <div class="callout" style="border-left:4px solid var(--danger)">
-        <strong>⚠ GA4 data load failed</strong><br>
-        ${e.message}<br><br>
-        ${reconnectNeeded
-          ? `<button onclick="window.navigate('ga4')" style="background:var(--gold);color:#000;border:none;padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-weight:600">🔐 Reconnect GA4</button>`
-          : `<button onclick="window.navigate('ga4')" style="padding:0.4rem 1rem;cursor:pointer;border-radius:6px">↻ Retry</button>`
-        }
-      </div>
-    `);
-    if (reconnectNeeded) window.renderGA4 = async () => { renderGA4Login(); };
-  }
 };
