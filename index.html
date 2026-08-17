@@ -3,8 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Eminza Marketing Intelligence & Optimisation Lab</title>
+  <meta name="robots" content="noindex, nofollow">
+  <title>Eminza Marketing Intelligence &amp; Optimisation Lab</title>
   <meta name="description" content="Internal marketing analytics platform — Eminza Group. Read-only analytical tool.">
+
+  <!-- Critical inline CSS: ensures dark theme loads instantly, before external stylesheet -->
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#0A1628;--surface:#0F2040;--card-bg:#142952;--border:#1E3A5F;
+      --text:#E8EDF5;--muted:#6B84A3;--accent-gold:#C9A84C;--gold:#C9A84C;
+      --success:#10B981;--danger:#EF4444;--warning:#F59E0B;
+      --border-color:#1E3A5F;
+    }
+    html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;font-size:14px;}
+    #login-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background:var(--bg);}
+    .login-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:2rem;width:100%;max-width:380px;}
+    .login-box input{width:100%;padding:0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:1rem;margin-bottom:1rem;outline:none;}
+    .login-box button{width:100%;padding:0.75rem;background:var(--gold);color:#000;border:none;border-radius:6px;font-weight:700;font-size:0.9rem;cursor:pointer;letter-spacing:0.05em;}
+    #app-content{display:none;height:100vh;overflow:hidden;}
+  </style>
+
   <link rel="stylesheet" href="styles.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -107,6 +126,6 @@
     })();
   </script>
 
-  <script src="app.js?v=20260814-69" onerror="document.getElementById('app-content').style.display='block';document.getElementById('app-content').innerHTML='<div style=padding:2rem;color:#EF4444>⚠ Failed to load app.js — server may be down</div>'"></script>
+  <script src="app.js?v=20260817-70" onerror="document.getElementById('app-content').style.display='block';document.getElementById('app-content').innerHTML='<div style=padding:2rem;color:#EF4444>⚠ Failed to load app.js — server may be down</div>'"></script>
 </body>
 </html>
