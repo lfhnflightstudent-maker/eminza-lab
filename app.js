@@ -37072,6 +37072,1453 @@ window.refreshCategory = function() {
 // --- wow_trends.js ---
 
 // ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+
+async function loadSuiviData() {
+  // Try local server first, then fall back to static suivi_data.json
+  const tryFetch = async (url) => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  };
+
+  try {
+    let json;
+    try {
+      json = await tryFetch('/api/suivi');
+    } catch(e) {
+      // No local server — load the static JSON file deployed alongside the app
+      json = await tryFetch('./suivi_data.json');
+    }
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
 // WEEKLY DATA ENGINE
 // Synthesises week-by-week data from YTD aggregates until real
 // weekly Google Sheets data is available.
@@ -40028,60 +41475,224 @@ window.renderGA4 = function() {
 
 
 // --- campaign_intelligence.js ---
-// ── CAMPAIGN INTELLIGENCE HUB v2 ─────────────────────────────────────────────
-// Unified tabbed view: GA4 truth vs Google Ads attribution
-// Tabs: Truth Dashboard | Spend vs Reality | Budget Reallocation | Market Intelligence | Audience Signals
+// ── CAMPAIGN INTELLIGENCE HUB v3 ─────────────────────────────────────────────
+// Deep intelligence layer: narrative analysis, health scores, wasted spend,
+// scenario modelling, market action plans, incrementality deep-dive
 
 (function() {
 'use strict';
 
-var PANELS = ['\u{1F4CA} Truth Dashboard','\u2696 Spend vs Reality','\u{1F3AF} Budget Reallocation','\u{1F5FA} Market Intelligence','\u{1F465} Audience Signals'];
-
+// ── Formatters ────────────────────────────────────────────────────────────────
 function fm(v)  { return '\u20ac' + Math.round(Math.abs(v||0)).toLocaleString('fr-FR'); }
-function fmK(v) { return Math.abs(v||0)>=5000 ? '\u20ac'+((v||0)/1000).toFixed(1)+'k' : fm(v); }
+function fmK(v) { return Math.abs(v||0)>=5000?'\u20ac'+((v||0)/1000).toFixed(1)+'k':fm(v); }
 function fmN(v) { return Math.round(v||0).toLocaleString('fr-FR'); }
 function fmP(v) { return ((v||0)*100).toFixed(1)+'%'; }
+function fmP1(v){ return ((v||0)*100).toFixed(0)+'%'; }
 function fmR(v) { return (v||0).toFixed(2)+'x'; }
-function rc(r)  { var vb=((window.FM||{}).variableBreakevenRoas)||1.69,pb=((window.FM||{}).profitBreakevenRoas)||2.79; return r>=pb?'var(--success)':r>=vb?'var(--warning)':'var(--danger)'; }
-function tb(t)  { return typeof window.tierBadge==='function'?window.tierBadge(t):'<span>'+t+'</span>'; }
-function card(lbl,val,sub,col) { return '<div class="card" style="flex:1;min-width:155px"><div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.25rem">'+lbl+'</div><div style="font-size:1.3rem;font-weight:800;color:'+(col||'var(--text)')+';line-height:1.1">'+val+'</div>'+(sub?'<div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">'+sub+'</div>':'')+'</div>'; }
-function bar(pct,col) { return '<div style="background:var(--border);border-radius:3px;height:5px;width:100%;margin-bottom:2px"><div style="background:'+col+';height:5px;border-radius:3px;width:'+Math.min(100,Math.max(0,pct))+'%"></div></div>'; }
-function abox(msg,type) { var c=type==='danger'?'var(--danger)':type==='warning'?'var(--warning)':type==='success'?'var(--success)':'var(--muted)'; return '<div style="background:'+c+'18;border-left:4px solid '+c+';padding:0.85rem 1.1rem;border-radius:0 8px 8px 0;margin-bottom:1.25rem;font-size:0.84rem;color:var(--text)">'+msg+'</div>'; }
+function fmR1(v){ return (v||0).toFixed(1)+'x'; }
+function sgn(v) { return v>0?'+':''; }
 
+function rc(r,vb,pb) {
+  vb=vb||((window.FM||{}).variableBreakevenRoas)||1.69;
+  pb=pb||((window.FM||{}).profitBreakevenRoas)||2.79;
+  return r>=pb?'var(--success)':r>=vb?'var(--warning)':'var(--danger)';
+}
+function tb(t) { return typeof window.tierBadge==='function'?window.tierBadge(t):'<b>'+t+'</b>'; }
+
+function card(lbl,val,sub,col,extra) {
+  return '<div class="card" style="flex:1;min-width:150px'+(extra?';'+extra:'')+'">'+
+    '<div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.2rem">'+lbl+'</div>'+
+    '<div style="font-size:1.25rem;font-weight:800;color:'+(col||'var(--text)')+';line-height:1.1">'+val+'</div>'+
+    (sub?'<div style="font-size:0.68rem;color:var(--muted);margin-top:0.2rem">'+sub+'</div>':'')+
+    '</div>';
+}
+function bar(pct,col,h) {
+  h=h||5;
+  return '<div style="background:var(--border);border-radius:3px;height:'+h+'px;width:100%;margin-bottom:2px">'+
+    '<div style="background:'+col+';height:'+h+'px;border-radius:3px;width:'+Math.min(100,Math.max(0,pct))+'%"></div></div>';
+}
+function abox(msg,type,style) {
+  var c=type==='danger'?'var(--danger)':type==='warning'?'var(--warning)':type==='success'?'var(--success)':type==='gold'?'var(--gold)':'var(--muted)';
+  return '<div style="background:'+c+'15;border-left:4px solid '+c+';padding:0.85rem 1.1rem;border-radius:0 8px 8px 0;margin-bottom:1rem;font-size:0.83rem;color:var(--text)'+(style?';'+style:'')+'">'+msg+'</div>';
+}
+function badge(txt,col) { return '<span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:12px;font-size:0.68rem;font-weight:700;background:'+col+'22;color:'+col+'">'+txt+'</span>'; }
+function trend(val) {
+  if (val===null||val===undefined) return '<span style="color:var(--muted)">&#8212;</span>';
+  var arrow=val>0.05?'&#8593;':val<-0.05?'&#8595;':'&#8594;';
+  var col=val>0.05?'var(--success)':val<-0.05?'var(--danger)':'var(--muted)';
+  return '<span style="color:'+col+';font-weight:700">'+arrow+' '+(val>0?'+':'')+((val||0)*100).toFixed(0)+'%</span>';
+}
+function scoreBar(score,max) {
+  max=max||100;
+  var pct=Math.min(100,(score/max)*100);
+  var col=score>=70?'var(--success)':score>=45?'var(--warning)':'var(--danger)';
+  return '<div style="display:flex;align-items:center;gap:6px">'+
+    '<div style="flex:1;background:var(--border);border-radius:4px;height:7px">'+
+    '<div style="background:'+col+';height:7px;border-radius:4px;width:'+pct+'%"></div></div>'+
+    '<span style="font-weight:700;color:'+col+';font-size:0.8rem;min-width:28px">'+Math.round(score)+'</span></div>';
+}
+
+// ── Analytics engine ──────────────────────────────────────────────────────────
+
+function tierHealth(bt, vb, pb) {
+  if (!bt||!(bt.adsCost>0)) return 0;
+  var useR = bt.ga4Roas>0 ? bt.ga4Roas : (bt.adsRoas||0)*0.6;
+  var roasS  = Math.min(50, (useR/pb)*50);
+  var qualS  = (bt.qualityScore||0)*25;
+  var gapS   = Math.max(0,25-(((bt.attributionGap||0)*100)));
+  return Math.min(100, Math.round(roasS+qualS+gapS));
+}
+
+function wastedSpend(bt, vb) {
+  if (!bt||!(bt.adsCost>0)) return 0;
+  var useR = bt.ga4Roas>0 ? bt.ga4Roas : 0;
+  if (useR<=0) return (bt.adsCost||0)*Math.min(0.5, (bt.attributionGap||0));
+  if (useR>=vb) return 0;
+  var beSpend = (bt.revenue||0)/vb;
+  return Math.max(0,(bt.adsCost||0)-beSpend);
+}
+
+function weeklyMomentum(weekly) {
+  if (!weekly||weekly.length<4) return null;
+  var n=weekly.length;
+  var r2=weekly.slice(Math.max(0,n-2)).reduce(function(s,w){return s+(w.sessions||0);},0);
+  var p2=weekly.slice(Math.max(0,n-4),Math.max(0,n-2)).reduce(function(s,w){return s+(w.sessions||0);},0);
+  return p2>0?(r2-p2)/p2:null;
+}
+
+function cvrMomentum(weekly) {
+  if (!weekly||weekly.length<4) return null;
+  var n=weekly.length;
+  function cvr(arr) { var s=arr.reduce(function(a,w){return a+(w.sessions||0);},0),c=arr.reduce(function(a,w){return a+(w.conversions||0);},0); return s>0?c/s:0; }
+  var r2=cvr(weekly.slice(Math.max(0,n-2)));
+  var p2=cvr(weekly.slice(Math.max(0,n-4),Math.max(0,n-2)));
+  return p2>0?(r2-p2)/p2:null;
+}
+
+function execNarrative(data) {
+  var ga4=data.ga4||{}, camps=data.camps||[], vb=data.vb, pb=data.pb;
+  var tSpend=data.tSpend, tAdsRev=data.tAdsRev, tGa4Rev=data.tGa4Rev, gap=data.gap;
+  var byTier=ga4.byTier||{}, byMkt=ga4.byMarket||{};
+  var lift=ga4.impliedIncrementalLift||0;
+  var mom=data.mom;
+
+  var lines=[];
+
+  // Sentence 1 — Portfolio health
+  var ga4R=tSpend>0?tGa4Rev/tSpend:0;
+  var adsR=tSpend>0?tAdsRev/tSpend:0;
+  if (ga4R>=pb) {
+    lines.push('Portfolio GA4 ROAS of <strong>'+fmR(ga4R)+'</strong> exceeds profit breakeven ('+fmR(pb)+'x) \u2014 the core business is generating real returns on ad spend.');
+  } else if (ga4R>=vb) {
+    lines.push('GA4 ROAS of <strong>'+fmR(ga4R)+'</strong> clears variable breakeven ('+fmR(vb)+'x) but sits below profit breakeven ('+fmR(pb)+'x) \u2014 the portfolio is contribution-positive but not yet generating net profit from advertising.');
+  } else if (ga4R>0) {
+    lines.push('GA4 ROAS of <strong>'+fmR(ga4R)+'</strong> is below variable breakeven ('+fmR(vb)+'x) \u2014 advertising is currently destroying value on a fully-loaded basis. Immediate reallocation is the highest-priority action.');
+  } else {
+    lines.push('GA4 revenue matching is pending UTM campaign parameter alignment. Session-level data across FR, DE, ES, IT and NL is loading. Market-level analysis is available in the Market Intelligence tab.');
+  }
+
+  // Sentence 2 — Attribution gap
+  if (gap>0.25) {
+    lines.push('Google Ads is over-attributing revenue by <strong>'+fmP(gap)+'</strong> (\u20ac'+Math.round(Math.abs(tAdsRev-tGa4Rev)).toLocaleString('fr-FR')+' phantom revenue). Smart bidding treats these phantom conversions as real and will keep scaling the campaigns that generate them. Your reported Ads ROAS of '+fmR(adsR)+'x is a fiction \u2014 the true return is '+fmR(ga4R)+'x.');
+  } else if (gap>0.1) {
+    lines.push('A moderate '+fmP(gap)+' attribution gap (\u20ac'+Math.round(Math.abs(tAdsRev-tGa4Rev)).toLocaleString('fr-FR')+' over-stated) means smart bidding is receiving distorted signals. Tiers with the largest gaps are most at risk of over-spending.');
+  } else if (tGa4Rev>0) {
+    lines.push('Attribution gap is within acceptable range ('+fmP(Math.abs(gap))+'). Ads and GA4 are broadly aligned, giving high confidence in campaign-level decisions.');
+  }
+
+  // Sentence 3 — Momentum
+  if (mom!==null&&mom!==undefined) {
+    if (mom>0.1) {
+      lines.push('Session momentum is <strong style="color:var(--success)">positive (+'+((mom*100).toFixed(0))+'% week-on-week)</strong> across all markets. Capitalise by directing growth spend toward high-quality tiers first.');
+    } else if (mom<-0.1) {
+      lines.push('Session volume is <strong style="color:var(--danger)">declining ('+((mom*100).toFixed(0))+'% week-on-week)</strong>. Investigate whether this is seasonal or driven by budget constraints. Budget reallocation risk is lower during decline phases \u2014 move conservatively.');
+    } else {
+      lines.push('Session volume is stable week-on-week. This is a low-noise environment to execute reallocation \u2014 changes will show signal quickly.');
+    }
+  }
+
+  // Sentence 4 — Incrementality
+  if (lift<5&&lift!==0) {
+    lines.push('<strong style="color:var(--danger)">Critical:</strong> Implied incremental lift of <strong>'+lift.toFixed(0)+'%</strong> indicates that the vast majority of conversions from returning users would occur organically. Zombie campaign spend is almost certainly destroying margin. The Budget Reallocation tab quantifies exactly how much.');
+  } else if (lift>30) {
+    lines.push('Strong implied incremental lift of <strong style="color:var(--success)">'+lift.toFixed(0)+'%</strong> suggests advertising is generating genuine demand. This provides justification for maintaining or growing total budget, provided ROAS targets are met tier-by-tier.');
+  }
+
+  // Sentence 5 — Top recommendation
+  var TORDER=['TOP','TOP SEASONAL','MID','LOW','ZOMBIE','CATCH ALL','NOUVEAUTES','BRANDING'];
+  var bestTier=null, worstTier=null, bestScore=0, worstScore=999;
+  TORDER.forEach(function(t){
+    var bt=byTier[t]; if(!bt||!(bt.adsCost>100))return;
+    var h=tierHealth(bt,vb,pb);
+    if(h>bestScore){bestScore=h;bestTier=t;}
+    if(h<worstScore){worstScore=h;worstTier=t;}
+  });
+  if (bestTier&&worstTier&&bestTier!==worstTier) {
+    var btW=byTier[worstTier],btB=byTier[bestTier];
+    var transferable=wastedSpend(btW,vb);
+    lines.push('<strong>Priority action:</strong> Transfer \u20ac'+Math.round(transferable).toLocaleString('fr-FR')+' from <strong>'+worstTier+'</strong> (health score '+tierHealth(btW,vb,pb)+'/100) to <strong>'+bestTier+'</strong> (health score '+tierHealth(btB,vb,pb)+'/100). At the destination\'s GA4 ROAS of '+fmR(btB.ga4Roas||btB.adsRoas)+'x this would generate an incremental \u20ac'+Math.round(transferable*(btB.ga4Roas>0?btB.ga4Roas:btB.adsRoas)).toLocaleString('fr-FR')+' in verified revenue.');
+  }
+
+  return lines;
+}
+
+// ── Tab switcher ──────────────────────────────────────────────────────────────
+var PANELS = ['&#128202; Truth Dashboard','&#9878; Spend vs Reality','&#127919; Budget Reallocation','&#128506; Market Intelligence','&#128101; Audience Signals'];
 window.ciTab = function(n) {
   for (var i=0;i<PANELS.length;i++) {
-    var p=document.getElementById('ci-p-'+i), b=document.getElementById('ci-b-'+i);
-    if (p) p.style.display=(i===n)?'':'none';
-    if (b) { b.style.background=(i===n)?'var(--gold)':'var(--surface)'; b.style.color=(i===n)?'#000':'var(--text)'; b.style.borderColor=(i===n)?'var(--gold)':'var(--border)'; }
+    var p=document.getElementById('ci-p-'+i),b=document.getElementById('ci-b-'+i);
+    if(p) p.style.display=(i===n)?'':'none';
+    if(b){b.style.background=(i===n)?'var(--gold)':'var(--surface)';b.style.color=(i===n)?'#000':'var(--text)';b.style.borderColor=(i===n)?'var(--gold)':'var(--border)';}
   }
 };
 
-window._applyGA4BudgetWeights = function() {
+// ── Apply to Budget Lab ───────────────────────────────────────────────────────
+window._applyGA4BudgetWeights = function(scenario) {
   var ga4=(window.EMINZA||{}).ga4||{}, byT=ga4.byTier||{}, camps=(window.EMINZA||{}).campaigns||[];
   var total=camps.reduce(function(s,c){return s+(c.cost||0);},0);
+  var vb=((window.FM||{}).variableBreakevenRoas)||1.69;
+  var pb=((window.FM||{}).profitBreakevenRoas)||2.79;
   var TIERS=['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
-  var scores={},sum=0;
+  scenario=scenario||'balanced';
+
+  // Compute raw GA4 score per tier
+  var scores={},curAlloc={},sumScore=0,sumCur=0;
   TIERS.forEach(function(t){
     var bt=byT[t]; if(!bt||!(bt.adsCost>0))return;
     var sc=bt.ga4Roas>0?bt.ga4Roas*Math.max(0.2,bt.qualityScore||0.5):(bt.adsRoas||0)*Math.max(0.1,(bt.qualityScore||0.3))*0.35;
-    scores[t]=Math.max(0,sc); sum+=scores[t];
+    scores[t]=Math.max(0,sc); sumScore+=scores[t];
+    curAlloc[t]=bt.adsCost; sumCur+=bt.adsCost;
   });
-  if(sum>0&&total>0&&typeof window._budgetAlloc!=='undefined') {
-    TIERS.forEach(function(t){ if(scores[t]!==undefined)window._budgetAlloc[t]=(scores[t]/sum)*total; });
-    window._budgetAllocTotal=total; window._ga4ModeActive=true;
-  }
-  window._ga4BudgetWeights=scores; window.navigate('budget');
+
+  if (sumScore<=0||total<=0||typeof window._budgetAlloc==='undefined') return;
+
+  // Blend current → GA4-optimal per scenario
+  var blend=scenario==='conservative'?0.25:scenario==='aggressive'?1.0:0.5;
+  TIERS.forEach(function(t){
+    if(scores[t]!==undefined){
+      var ga4Tgt=(scores[t]/sumScore)*total;
+      var curTgt=curAlloc[t]||0;
+      window._budgetAlloc[t]=curTgt+(ga4Tgt-curTgt)*blend;
+    }
+  });
+  window._budgetAllocTotal=total;
+  window._ga4ModeActive=true;
+  window._ga4ScenarioApplied=scenario;
+  window._ga4BudgetWeights=scores;
+  window.navigate('budget');
 };
 
+// ── Main render ───────────────────────────────────────────────────────────────
 window.renderCampaignIntelligence = function() {
   var d=window.EMINZA||{}, ga4=d.ga4||{}, camps=d.campaigns||[], FM=window.FM||{};
   var vb=FM.variableBreakevenRoas||1.69, pb=FM.profitBreakevenRoas||2.79;
+  var cm=FM.contributionMargin||0.358;
 
   if (!ga4.ready) {
     var nh='<div style="padding:4rem 1rem;text-align:center">';
     nh+='<div style="font-size:3rem;margin-bottom:0.75rem">&#129504;</div>';
     nh+='<h2 style="color:var(--gold);margin-bottom:0.5rem">Campaign Intelligence Hub</h2>';
-    nh+='<p style="color:var(--muted);max-width:520px;margin:0 auto 2rem;line-height:1.6">Connect GA4 to unlock the integrated view &#8212; Google attribution vs GA4 reality across FR, DE, ES, IT and NL, with GA4-driven budget recommendations.</p>';
+    nh+='<p style="color:var(--muted);max-width:520px;margin:0 auto 2rem;line-height:1.6">Connect GA4 to unlock deep intelligence across FR, DE, ES, IT and NL &mdash; attribution reality checks, tier health scores, wasted spend to the euro, and GA4-corrected budget scenarios.</p>';
     nh+='<button style="background:var(--gold);color:#000;padding:0.75rem 2rem;border:none;border-radius:6px;cursor:pointer;font-weight:700;font-size:1rem" ';
     nh+="onclick=\"window.ga4Connect(function(){ window.ga4LoadAll().then(function(r){ window.ga4ProcessAll(r); window.navigate('intelligence'); }) })\">Connect GA4 to unlock</button></div>";
     setMain(nh); return;
@@ -40091,189 +41702,783 @@ window.renderCampaignIntelligence = function() {
   var GA4_PROPS=(typeof GA4_PROPERTIES!=='undefined')?GA4_PROPERTIES:{};
   var MKTS=['FR','DE','ES','IT','NL'];
   var TORDER=['TOP','TOP SEASONAL','MID','LOW','ZOMBIE','CATCH ALL','NOUVEAUTES','BRANDING'];
+
   var tSpend=camps.reduce(function(s,c){return s+(c.cost||0);},0);
   var tAdsRev=camps.reduce(function(s,c){return s+(c.convValue||0);},0);
   var tGa4Rev=Object.values(byMkt).reduce(function(s,m){return s+(m.revenue||0);},0);
   var tSess=Object.values(byMkt).reduce(function(s,m){return s+(m.sessions||0);},0);
+  var tConv=Object.values(byMkt).reduce(function(s,m){return s+(m.cvr||0)*(m.sessions||0);},0);
   var adsR=tSpend>0?tAdsRev/tSpend:0, ga4R=tSpend>0?tGa4Rev/tSpend:0;
   var gap=tAdsRev>0?(tAdsRev-tGa4Rev)/tAdsRev:0;
   var lift=ga4.impliedIncrementalLift||0, retS=ga4.returningShare||0;
+  var weekly=ga4.weekly||[], mom=weeklyMomentum(weekly), cvrMom=cvrMomentum(weekly);
   var sync=ga4.lastFetched?new Date(ga4.lastFetched).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'--';
+  var portfolioCVR=tSess>0?tConv/tSess:0;
+
+  // Pre-compute per-tier health + wasted spend
+  var totalWasted=0, totalHealth=0, healthCount=0;
+  var tierScores={};
+  TORDER.forEach(function(t){
+    var bt=byTier[t]; if(!bt||!(bt.adsCost>0))return;
+    var hs=tierHealth(bt,vb,pb), ws=wastedSpend(bt,vb);
+    tierScores[t]={health:hs,wasted:ws};
+    totalWasted+=ws; totalHealth+=hs; healthCount++;
+  });
+  var avgHealth=healthCount>0?totalHealth/healthCount:0;
+
+  // Total wasted spend estimate from attribution gap
+  var gapWaste=tSpend>0?Math.max(0, tSpend*(1-(ga4R/Math.max(adsR,0.01)))*0.6):0;
+  var maxPossibleRev=tGa4Rev+(totalWasted*ga4R);
+
+  var connMkts=MKTS.filter(function(m){return (byMkt[m]||{}).sessions>0;});
+
+  // Build executive narrative
+  var narrativeLines=execNarrative({
+    ga4:ga4, camps:camps, vb:vb, pb:pb,
+    tSpend:tSpend, tAdsRev:tAdsRev, tGa4Rev:tGa4Rev, gap:gap, mom:mom
+  });
 
   var h='<div style="padding:0 0 2rem">';
-  h+='<div style="display:flex;align-items:flex-start;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap">';
-  h+='<div><h1 style="margin:0 0 0.25rem;font-size:1.5rem">Campaign Intelligence Hub</h1>';
-  h+='<p style="color:var(--muted);font-size:0.8rem;margin:0">'+MKTS.filter(function(m){return (byMkt[m]||{}).sessions>0;}).length+' markets &middot; '+fmN(tSess)+' GA4 sessions &middot; synced '+sync+'</p></div>';
-  if(window._ga4ModeActive){h+='<div style="margin-left:auto;background:rgba(201,168,76,0.15);border:1px solid var(--gold);border-radius:6px;padding:0.3rem 0.75rem;font-size:0.75rem;color:var(--gold)">&#127919; GA4 Mode active in Budget Lab</div>';}
-  h+='</div>';
+
+  // ── Header ─────────────────────────────────────────────────
+  h+='<div style="display:flex;align-items:flex-start;gap:1rem;margin-bottom:1.25rem;flex-wrap:wrap">';
+  h+='<div><h1 style="margin:0 0 0.2rem;font-size:1.5rem">Campaign Intelligence Hub <span style="font-size:0.6em;font-weight:400;color:var(--muted)">v3</span></h1>';
+  h+='<p style="color:var(--muted);font-size:0.8rem;margin:0">'+connMkts.length+' markets connected &middot; '+fmN(tSess)+' GA4 sessions &middot; '+fmN(camps.length)+' campaigns &middot; synced '+sync;
+  if(mom!==null){h+=' &middot; '+trend(mom)+' WoW';}
+  h+='</p></div>';
+  h+='<div style="margin-left:auto;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">';
+  var portHealth=avgHealth;
+  var portCol=portHealth>=70?'var(--success)':portHealth>=45?'var(--warning)':'var(--danger)';
+  h+='<div style="background:'+portCol+'18;border:1px solid '+portCol+';border-radius:6px;padding:0.3rem 0.75rem;font-size:0.75rem;font-weight:700;color:'+portCol+'">Portfolio Health: '+Math.round(portHealth)+'/100</div>';
+  if(window._ga4ModeActive){h+='<div style="background:rgba(201,168,76,0.15);border:1px solid var(--gold);border-radius:6px;padding:0.3rem 0.75rem;font-size:0.75rem;color:var(--gold)">&#127919; GA4 Mode active</div>';}
+  h+='</div></div>';
+
+  // Tabs
   h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:1.75rem;padding-bottom:1rem;border-bottom:1px solid var(--border)">';
   PANELS.forEach(function(label,i){
     h+='<button id="ci-b-'+i+'" onclick="window.ciTab('+i+')" style="padding:0.4rem 1rem;border:1px solid '+(i===0?'var(--gold)':'var(--border)')+';border-radius:20px;cursor:pointer;font-size:0.82rem;font-weight:600;background:'+(i===0?'var(--gold)':'var(--surface)')+';color:'+(i===0?'#000':'var(--text)')+'">'+label+'</button>';
   });
   h+='</div>';
 
-  // P0: TRUTH DASHBOARD ─────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════
+  // P0 — TRUTH DASHBOARD (deep)
+  // ════════════════════════════════════════════════════════════
   h+='<div id="ci-p-0">';
+
+  // Executive brief
+  if(narrativeLines.length>0){
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.1rem 1.3rem;margin-bottom:1.5rem">';
+    h+='<div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:1px;color:var(--gold);font-weight:700;margin-bottom:0.75rem">&#129504; Executive Intelligence Brief</div>';
+    narrativeLines.forEach(function(l){
+      h+='<p style="margin:0 0 0.6rem;font-size:0.84rem;line-height:1.6;color:var(--text)">'+l+'</p>';
+    });
+    h+='</div>';
+  }
+
+  // Alert strip — critical findings
+  var alerts=[];
+  if(gap>0.3) alerts.push({type:'danger',msg:'Attribution gap: &euro;'+Math.round(Math.abs(tAdsRev-tGa4Rev)).toLocaleString('fr-FR')+' of Ads-reported revenue has no GA4 match. Smart bidding is optimising toward phantom conversions.'});
+  if(lift<5&&lift!==0) alerts.push({type:'danger',msg:'Incremental lift only '+lift.toFixed(0)+'%. Most returning-user conversions are organic &mdash; ZOMBIE campaigns are claiming credit for demand that would exist without ads.'});
+  if(ga4R>0&&ga4R<vb) alerts.push({type:'danger',msg:'GA4 ROAS '+fmR(ga4R)+' is below variable breakeven '+fmR(vb)+'x. Every &euro; spent currently destroys contribution margin.'});
+  if(totalWasted>5000) alerts.push({type:'warning',msg:'Estimated wasted spend across below-breakeven tiers: &euro;'+Math.round(totalWasted).toLocaleString('fr-FR')+'. Reallocation to top-performing tiers is the highest-ROI action available.'});
+  if(mom!==null&&mom<-0.15) alerts.push({type:'warning',msg:'Session volume declining '+((Math.abs(mom)*100).toFixed(0))+'% WoW. Investigate budget constraints or seasonal factors before making reallocation decisions.'});
+  if(retS>0.65) alerts.push({type:'warning',msg:''+fmP1(retS)+' of sessions are returning visitors. High recapture rate suggests significant ZOMBIE spend across the account.'});
+  alerts.slice(0,4).forEach(function(a){h+=abox(a.msg,a.type);});
+
+  // KPI grid — 12 cards in 2 rows
   var gapC=gap>0.3?'var(--danger)':(gap>0.1?'var(--warning)':'var(--success)');
-  var gapMsg;
-  if(tGa4Rev===0&&tSess>0){gapMsg='GA4 sessions loaded. Revenue matching needs utm_campaign= matching Ads names. Market-level GA4 data in Market Intelligence tab.';}
-  else if(gap>0.3){gapMsg='<strong style="color:var(--danger)">&#9888; Over-attribution ('+fmP(gap)+')</strong> &mdash; Google Ads overcounts by '+fm(tAdsRev-tGa4Rev)+'. Smart bidding optimises toward phantom conversions.';}
-  else if(gap>0.1){gapMsg='<strong style="color:var(--warning)">Moderate gap ('+fmP(gap)+')</strong> &mdash; Ads attributes '+fm(tAdsRev-tGa4Rev)+' more than GA4.';}
-  else if(tGa4Rev>0){gapMsg='<strong style="color:var(--success)">&#10003; Attribution healthy</strong> &mdash; Ads and GA4 broadly aligned ('+fmP(Math.abs(gap))+' gap).';}
-  else{gapMsg='Fetching GA4 data...';}
+  var effScore=tSpend>0?((tGa4Rev/tSpend)/(pb)*100):0; // % of target
+  var avgQS=connMkts.reduce(function(s,m){return s+(byMkt[m]||{}).qualityScore||0;},0)/Math.max(1,connMkts.length);
 
-  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem">';
-  h+=card('GA4 Sessions',fmN(tSess),'all markets YTD','var(--text)');
-  h+=card('GA4 Revenue',fm(tGa4Rev),'from GA4 properties','var(--text)');
-  h+=card('Ads Attributed',fm(tAdsRev),'Google Ads reported','var(--muted)');
-  h+=card('Attribution Gap',fmP(gap),tAdsRev>tGa4Rev?'Ads overcounts '+fm(Math.abs(tAdsRev-tGa4Rev)):(tGa4Rev>tAdsRev?'GA4 higher':'--'),gapC);
-  h+='</div><div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.25rem">';
-  h+=card('Ads ROAS',fmR(adsR),"Google's view",rc(adsR));
-  h+=card('GA4 ROAS',fmR(ga4R),'true performance',rc(ga4R));
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:0.6rem">';
+  h+=card('GA4 Sessions',fmN(tSess),(mom!==null?trend(mom)+' WoW':'all mkts YTD'),'var(--text)');
+  h+=card('GA4 Revenue',fm(tGa4Rev),connMkts.length+' markets connected','var(--text)');
+  h+=card('True GA4 ROAS',fmR(ga4R),'GA4 verified',rc(ga4R,vb,pb));
+  h+=card('Ads ROAS',fmR(adsR),'Google\'s view &mdash; last-click',rc(adsR,vb,pb));
+  h+=card('Attribution Gap',fmP(gap),gap>0?'Ads overcounts by '+fm(Math.abs(tAdsRev-tGa4Rev)):'GA4 &ge; Ads',gapC);
   h+=card('Total Spend',fm(tSpend),'YTD all campaigns','var(--text)');
-  h+=card('Implied Lift',lift.toFixed(0)+'%','new vs returning CVR diff',lift>30?'var(--success)':(lift>10?'var(--warning)':'var(--danger)'));
   h+='</div>';
-  h+=abox(gapMsg,gap>0.3?'danger':(gap>0.1?'warning':(tGa4Rev>0?'success':'info')));
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.5rem">';
+  h+=card('Implied Lift',lift.toFixed(0)+'%','new vs returning CVR gap',lift>30?'var(--success)':(lift>10?'var(--warning)':'var(--danger)'));
+  h+=card('Returning Share',fmP(retS),'of all GA4 sessions',retS>0.6?'var(--danger)':(retS>0.45?'var(--warning)':'var(--success)'));
+  h+=card('Portfolio CVR',fmP(portfolioCVR),'sessions &rarr; transactions',portfolioCVR>0.03?'var(--success)':(portfolioCVR>0.01?'var(--warning)':'var(--danger)'));
+  h+=card('Avg Quality Score',(avgQS*10).toFixed(1)+'/10','engagement+bounce+duration',avgQS>0.6?'var(--success)':(avgQS>0.35?'var(--warning)':'var(--danger)'));
+  h+=card('Estimated Wasted Spend',fmK(totalWasted),'below breakeven tiers','var(--danger)');
+  h+=card('Spend Efficiency',Math.min(999,effScore).toFixed(0)+'%','of profit-breakeven ROAS',effScore>=100?'var(--success)':(effScore>=60?'var(--warning)':'var(--danger)'));
+  h+='</div>';
 
-  h+='<h3 style="margin:1.5rem 0 0.75rem;font-size:1rem;font-weight:700">Performance by Market</h3>';
-  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem">';
+  // Tier Health Scorecard
+  h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Tier Health Scorecard</h3>';
+  h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Score = GA4 ROAS (50 pts) + Session Quality (25 pts) + Attribution Accuracy (25 pts). Below 45 = urgent action needed.</p>';
+  h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr>';
+  h+='<th>Tier</th><th>Health Score</th><th style="text-align:right">Spend</th><th style="text-align:right">GA4 ROAS</th><th style="text-align:right">Ads ROAS</th>';
+  h+='<th style="text-align:right">Quality</th><th style="text-align:right">Gap%</th><th style="text-align:right">Wasted &euro;</th><th>Verdict</th></tr></thead><tbody>';
+
+  TORDER.forEach(function(t){
+    var bt=byTier[t]; if(!bt||!(bt.adsCost>0))return;
+    var sc=tierScores[t]||{health:0,wasted:0};
+    var hv=sc.health;
+    var wv=sc.wasted;
+    var hcol=hv>=70?'var(--success)':hv>=45?'var(--warning)':'var(--danger)';
+    var verdict,vC;
+    if(hv>=75){verdict='&#10003; Strong performer';vC='var(--success)';}
+    else if(hv>=55){verdict='&#8594; Monitor &amp; maintain';vC='var(--warning)';}
+    else if(hv>=35){verdict='&#8595; Reduce &amp; rebalance';vC='var(--warning)';}
+    else{verdict='&#128680; Urgent restructure';vC='var(--danger)';}
+
+    h+='<tr>';
+    h+='<td>'+tb(t)+'</td>';
+    h+='<td style="min-width:120px">'+scoreBar(hv)+'</td>';
+    h+='<td style="text-align:right">'+fmK(bt.adsCost||0)+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.ga4Roas||0,vb,pb)+';font-weight:600">'+(bt.ga4Roas>0?fmR(bt.ga4Roas):'<span style="color:var(--muted)">&mdash;</span>')+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.adsRoas||0,vb,pb)+'">'+fmR(bt.adsRoas||0)+'</td>';
+    h+='<td style="text-align:right">'+(bt.qualityScore?(bt.qualityScore*10).toFixed(1)+'/10':'&mdash;')+'</td>';
+    h+='<td style="text-align:right;color:'+(bt.attributionGap>0.2?'var(--danger)':bt.attributionGap>0.05?'var(--warning)':'var(--success)')+'">'+(bt.attributionGap?(bt.attributionGap*100).toFixed(1)+'%':'&mdash;')+'</td>';
+    h+='<td style="text-align:right;color:'+(wv>1000?'var(--danger)':wv>200?'var(--warning)':'var(--muted)');
+    h+=';font-weight:'+(wv>500?'700':'400')+'">'+(wv>50?fmK(wv):'&mdash;')+'</td>';
+    h+='<td style="color:'+vC+';font-weight:600;font-size:0.8rem">'+verdict+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table>';
+
+  // Weekly momentum section
+  if(weekly.length>=4){
+    var n=weekly.length;
+    var last4=weekly.slice(Math.max(0,n-4));
+    var prev4=weekly.slice(Math.max(0,n-8),Math.max(0,n-4));
+    var maxW=Math.max.apply(null,weekly.slice(-10).map(function(w){return w.sessions||0;}));
+    h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Weekly Momentum</h3>';
+    h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1rem">';
+    var recentSess=last4.reduce(function(s,w){return s+(w.sessions||0);},0);
+    var priorSess=prev4.reduce(function(s,w){return s+(w.sessions||0);},0);
+    var recentConv=last4.reduce(function(s,w){return s+(w.conversions||0);},0);
+    var priorConv=prev4.reduce(function(s,w){return s+(w.conversions||0);},0);
+    var recentEng=last4.reduce(function(s,w){return s+(w.engagedSessions||0);},0);
+    var priorEng=prev4.reduce(function(s,w){return s+(w.engagedSessions||0);},0);
+    var sessMom=priorSess>0?(recentSess-priorSess)/priorSess:null;
+    var convMom=priorConv>0?(recentConv-priorConv)/priorConv:null;
+    var engMom=priorEng>0?(recentEng-priorEng)/priorEng:null;
+    h+=card('Sessions (last 4w)',fmN(recentSess),(sessMom!==null?trend(sessMom)+' vs prior 4w':''),'var(--text)');
+    h+=card('Conversions (last 4w)',fmN(recentConv),(convMom!==null?trend(convMom)+' vs prior 4w':''),'var(--text)');
+    h+=card('Engaged Sessions',fmN(recentEng),(engMom!==null?trend(engMom)+' vs prior 4w':''),'var(--text)');
+    var cvrLast=recentSess>0?recentConv/recentSess:0;
+    h+=card('CVR (last 4w)',fmP(cvrLast),(cvrMom!==null?trend(cvrMom)+' vs prior 4w':''),cvrLast>0.03?'var(--success)':(cvrLast>0.01?'var(--warning)':'var(--danger)'));
+    h+='</div>';
+    h+='<div style="overflow-x:auto"><table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr><th>Week</th><th style="text-align:right">Sessions</th><th style="text-align:right">Conversions</th><th style="text-align:right">CVR</th><th style="text-align:right">Engagement Rate</th><th>Trend</th></tr></thead><tbody>';
+    var wArr=weekly.slice(-10);
+    for(var wi=0;wi<wArr.length;wi++){
+      var ww=wArr[wi];
+      var er=ww.sessions>0?(ww.engagedSessions||0)/ww.sessions:0;
+      var wcvr=ww.sessions>0?(ww.conversions||0)/ww.sessions:0;
+      var prevW=wi>0?wArr[wi-1]:null;
+      var wMom=prevW&&prevW.sessions>0?(ww.sessions-prevW.sessions)/prevW.sessions:null;
+      h+='<tr><td>W'+ww.week+'</td>';
+      h+='<td style="text-align:right">'+fmN(ww.sessions)+'<br>'+bar((ww.sessions||0)/maxW*100,'var(--gold)')+'</td>';
+      h+='<td style="text-align:right">'+fmN(ww.conversions||0)+'</td>';
+      h+='<td style="text-align:right;font-weight:600;color:'+rc(wcvr*50,0.02,0.04)+'">'+fmP(wcvr)+'</td>';
+      h+='<td style="text-align:right">'+fmP(er)+'</td>';
+      h+='<td>'+(wMom!==null?trend(wMom):'&mdash;')+'</td></tr>';
+    }
+    h+='</tbody></table></div>';
+  }
+
+  // Market opportunity matrix
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Market Opportunity Matrix</h3>';
+  h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Quadrant based on GA4 ROAS vs session quality. Top-right = scale; Bottom-left = restructure.</p>';
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.5rem">';
   MKTS.forEach(function(mkt){
-    var bm=byMkt[mkt]||{},mc=camps.filter(function(c){return c.market===mkt;});
-    var ms=mc.reduce(function(s,c){return s+(c.cost||0);},0),mr=mc.reduce(function(s,c){return s+(c.convValue||0);},0);
-    var mAR=ms>0?mr/ms:0,mGR=ms>0?(bm.revenue||0)/ms:0,mg=mr>0?(mr-(bm.revenue||0))/mr:0;
-    var hasD=(bm.sessions||0)>0,bdr=hasD?(mg>0.2?'var(--danger)':(mg>0.05?'var(--warning)':'var(--success)')):'var(--border)';
-    h+='<div style="background:var(--surface);border:1px solid var(--border);border-top:3px solid '+bdr+';border-radius:8px;padding:0.85rem 1rem;min-width:140px;flex:1">';
-    h+='<div style="display:flex;justify-content:space-between;margin-bottom:0.4rem"><span style="font-weight:800;color:var(--gold);font-size:1.05rem">'+mkt+'</span><span style="font-size:0.65rem;color:var(--muted)">'+((GA4_PROPS[mkt]||{}).domain||'')+'</span></div>';
-    if(!hasD){h+='<div style="color:var(--muted);font-size:0.77rem;font-style:italic">No GA4 data</div>';}
-    else{h+='<div style="font-size:1.2rem;font-weight:700">'+fmN(bm.sessions)+'<span style="font-size:0.65rem;font-weight:400;color:var(--muted)"> sess</span></div>';h+='<div style="font-size:0.77rem;margin-top:0.35rem;display:flex;justify-content:space-between"><span style="color:var(--muted)">GA4 ROAS</span><span style="color:'+rc(mGR)+';font-weight:700">'+fmR(mGR)+'</span></div>';h+='<div style="font-size:0.77rem;display:flex;justify-content:space-between"><span style="color:var(--muted)">Ads ROAS</span><span style="color:'+rc(mAR)+'">'+fmR(mAR)+'</span></div>';if(Math.abs(mg)>0.05&&mr>0){h+='<div style="font-size:0.67rem;margin-top:0.25rem;color:'+(mg>0.2?'var(--danger)':'var(--warning)')+'">'+( mg>0?'&uarr; Ads over ':'&darr; GA4 > Ads ')+fmP(Math.abs(mg))+'</div>';}}
+    var bm=byMkt[mkt]||{};
+    var mc=camps.filter(function(c){return c.market===mkt;});
+    var ms=mc.reduce(function(s,c){return s+(c.cost||0);},0);
+    var mr=mc.reduce(function(s,c){return s+(c.convValue||0);},0);
+    var mGR=ms>0?(bm.revenue||0)/ms:0;
+    var qs=bm.qualityScore||0;
+    var hasD=(bm.sessions||0)>0;
+    var quadrant,qC,qIcon;
+    if(!hasD){quadrant='No data';qC='var(--muted)';qIcon='?';}
+    else if(mGR>=vb&&qs>=0.5){quadrant='Scale';qC='var(--success)';qIcon='&#8593;&#8593;';}
+    else if(mGR>=vb&&qs<0.5){quadrant='Improve quality';qC='var(--warning)';qIcon='&#8679;';}
+    else if(mGR<vb&&qs>=0.5){quadrant='Fix funnel';qC='var(--warning)';qIcon='&#8680;';}
+    else{quadrant='Restructure';qC='var(--danger)';qIcon='&#8595;&#8595;';}
+    var revPerSess=bm.sessions>0?(bm.revenue||0)/bm.sessions:0;
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-top:3px solid '+qC+';border-radius:8px;padding:1rem;min-width:155px;flex:1">';
+    h+='<div style="display:flex;justify-content:space-between;margin-bottom:0.5rem">';
+    h+='<span style="font-weight:800;color:var(--gold);font-size:1.1rem">'+mkt+'</span>';
+    h+='<span style="font-size:1.2rem">'+qIcon+'</span></div>';
+    h+='<div style="font-size:0.72rem;font-weight:700;color:'+qC+';margin-bottom:0.6rem">'+quadrant+'</div>';
+    if(!hasD){h+='<div style="color:var(--muted);font-size:0.77rem;font-style:italic">No GA4 data loaded</div>';}
+    else{
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:0.2rem"><span style="color:var(--muted)">GA4 ROAS</span><strong style="color:'+rc(mGR,vb,pb)+'">'+fmR(mGR)+'</strong></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Quality</span><strong>'+(qs*10).toFixed(1)+'/10</strong></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Sessions</span><strong>'+fmN(bm.sessions)+'</strong></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.78rem"><span style="color:var(--muted)">Rev/session</span><strong>'+fm(revPerSess)+'</strong></div>';
+    }
     h+='</div>';
   });
   h+='</div>';
-  var wk=(ga4.weekly||[]).slice(-10);
-  if(wk.length>0){
-    var maxW=Math.max.apply(null,wk.map(function(w){return w.sessions||0;}));
-    h+='<h3 style="margin:0 0 0.75rem;font-size:1rem;font-weight:700">Weekly Trend (last 10 weeks)</h3><div style="overflow-x:auto"><table class="table" style="width:100%"><thead><tr><th>Week</th><th style="text-align:right">Sessions</th><th style="text-align:right">Conversions</th><th style="text-align:right">Engagement Rate</th></tr></thead><tbody>';
-    wk.forEach(function(w){var er=w.sessions>0?(w.engagedSessions||0)/w.sessions:0;h+='<tr><td>W'+w.week+'</td><td style="text-align:right">'+fmN(w.sessions)+' '+bar((w.sessions||0)/maxW*100,'var(--gold)')+'</td><td style="text-align:right">'+fmN(w.conversions||0)+'</td><td style="text-align:right">'+fmP(er)+'</td></tr>';});
-    h+='</tbody></table></div>';
-  }
+  h+='</div>'; // end P0
+
+  // ════════════════════════════════════════════════════════════
+  // P1 — SPEND vs REALITY (deep)
+  // ════════════════════════════════════════════════════════════
+  h+='<div id="ci-p-1" style="display:none">';
+
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.25rem">';
+  h+=card('Total Revenue at Risk',fm(gapWaste),'estimated from attr. gap &amp; tier mix','var(--danger)');
+  h+=card('Wasted Below-Breakeven',fm(totalWasted),'spend on negative-return tiers','var(--danger)');
+  h+=card('Recovery Potential',fm(totalWasted*(ga4R>0?ga4R:adsR*0.6)),'if wasted spend reallocated at portfolio GA4 ROAS','var(--success)');
+  h+=card('Confidence in GA4 Data',ga4.campaigns&&ga4.campaigns.length>0?Math.min(99,ga4.campaigns.length*3)+'%':'Low','based on matched campaign count','var(--muted)');
   h+='</div>';
 
-  // P1: SPEND vs REALITY ────────────────────────────────────────
-  h+='<div id="ci-p-1" style="display:none">';
-  h+='<p style="color:var(--muted);font-size:0.84rem;margin-bottom:1.25rem">Google scales tiers with high attributed ROAS. This table shows where that diverges from GA4 reality &mdash; where Google over-rewards inefficient spend.</p>';
+  // Main tier comparison table
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Attribution Reality by Tier</h3>';
+  h+='<table class="table" style="width:100%;margin-bottom:0.75rem"><thead><tr>';
+  h+='<th>Tier</th><th style="text-align:right">Spend</th>';
+  h+='<th style="text-align:right">Ads ROAS<br><small style="font-weight:400;color:var(--muted)">Last-click</small></th>';
+  h+='<th style="text-align:right">GA4 ROAS<br><small style="font-weight:400;color:var(--muted)">True</small></th>';
+  h+='<th style="text-align:right">Gap%<br><small style="font-weight:400;color:var(--muted)">Ads overcount</small></th>';
+  h+='<th style="text-align:right">Wasted &euro;<br><small style="font-weight:400;color:var(--muted)">Below breakeven</small></th>';
+  h+='<th style="text-align:right">Quality</th>';
+  h+='<th style="text-align:right">Sessions</th>';
+  h+='<th>Google says</th><th>GA4 says</th><th>Conflict</th></tr></thead><tbody>';
+
   var dangerT=[];
-  h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr><th>Tier</th><th style="text-align:right">Spend</th><th style="text-align:right">Ads ROAS<br><small style="font-weight:400;color:var(--muted)">Google view</small></th><th style="text-align:right">GA4 ROAS<br><small style="font-weight:400;color:var(--muted)">True ROAS</small></th><th style="text-align:right">Gap%</th><th style="text-align:right">Quality</th><th>Google says</th><th>GA4 says</th><th>Verdict</th></tr></thead><tbody>';
   TORDER.forEach(function(t){
     var bt=byTier[t]; if(!bt||!(bt.adsCost>0))return;
     var rawG=(bt.adsRoas>0&&bt.ga4Roas>0)?(bt.adsRoas-bt.ga4Roas)/bt.adsRoas:0;
     var gC=rawG>0.3?'var(--danger)':(rawG>0.1?'var(--warning)':'var(--success)');
-    var gS,gCol; if(bt.adsRoas>=pb){gS='&uarr; Scale';gCol='var(--success)';}else if(bt.adsRoas>=vb){gS='&rarr; Maintain';gCol='var(--warning)';}else{gS='&darr; Review';gCol='var(--danger)';}
-    var g4S,g4C; if(bt.ga4Roas<=0){g4S='? No GA4';g4C='var(--muted)';}else if(bt.ga4Roas>=pb&&(bt.qualityScore||0)>=0.5){g4S='&uarr; Scale';g4C='var(--success)';}else if(bt.ga4Roas>=vb){g4S='&rarr; Maintain';g4C='var(--warning)';}else{g4S='&darr; Cut budget';g4C='var(--danger)';}
-    var vv,vC; if(bt.ga4Roas<=0){vv='&#9675; No GA4 data';vC='var(--muted)';}else if(g4S.includes('Cut')&&gS.includes('Scale')){vv='&#128680; Critical gap';vC='var(--danger)';dangerT.push(t);}else if(gS===g4S){vv='&#10003; Aligned';vC='var(--success)';}else{vv='&#9888; Divergent';vC='var(--warning)';}
-    h+='<tr><td>'+tb(t)+'</td><td style="text-align:right">'+fmK(bt.adsCost||0)+'</td><td style="text-align:right;color:'+rc(bt.adsRoas||0)+';font-weight:600">'+fmR(bt.adsRoas||0)+'</td><td style="text-align:right;color:'+rc(bt.ga4Roas||0)+';font-weight:600">'+(bt.ga4Roas>0?fmR(bt.ga4Roas):'<span style="color:var(--muted)">&mdash;</span>')+'</td><td style="text-align:right;color:'+gC+'">'+(rawG!==0?(rawG>0?'-':'+')+fmP(Math.abs(rawG)):'&mdash;')+'</td><td style="text-align:right">'+(bt.qualityScore?(bt.qualityScore*10).toFixed(1)+'/10':'&mdash;')+'</td><td style="color:'+gCol+';font-weight:600">'+gS+'</td><td style="color:'+g4C+';font-weight:600">'+g4S+'</td><td style="color:'+vC+';font-weight:700">'+vv+'</td></tr>';
+    var wv=tierScores[t]?tierScores[t].wasted:0;
+    var gS,gCol;
+    if(bt.adsRoas>=pb){gS='&uarr;&uarr; Scale';gCol='var(--success)';}
+    else if(bt.adsRoas>=vb){gS='&rarr; Maintain';gCol='var(--warning)';}
+    else{gS='&darr; Review';gCol='var(--danger)';}
+    var g4S,g4C;
+    if(bt.ga4Roas<=0){g4S='? Unverified';g4C='var(--muted)';}
+    else if(bt.ga4Roas>=pb&&(bt.qualityScore||0)>=0.5){g4S='&uarr;&uarr; Scale';g4C='var(--success)';}
+    else if(bt.ga4Roas>=pb){g4S='&uarr; Scale carefully';g4C='var(--warning)';}
+    else if(bt.ga4Roas>=vb){g4S='&rarr; Maintain';g4C='var(--warning)';}
+    else{g4S='&darr;&darr; Cut budget';g4C='var(--danger)';}
+    var conflict,cfC;
+    if(bt.ga4Roas<=0){conflict=badge('Unverified','var(--muted)');cfC='var(--muted)';}
+    else if(g4S.includes('Cut')&&gS.includes('Scale')){conflict=badge('&#128680; Critical','var(--danger)');cfC='var(--danger)';dangerT.push(t);}
+    else if(g4S.includes('Cut')&&gS.includes('Maintain')){conflict=badge('&#9888; Divergent','var(--warning)');cfC='var(--warning)';}
+    else if(gS.includes('Scale')&&g4S.includes('Maintain')){conflict=badge('Misaligned','var(--warning)');cfC='var(--warning)';}
+    else if(g4S===gS){conflict=badge('&#10003; Aligned','var(--success)');cfC='var(--success)';}
+    else{conflict=badge('&#9888; Divergent','var(--warning)');cfC='var(--warning)';}
+
+    h+='<tr>';
+    h+='<td>'+tb(t)+'</td>';
+    h+='<td style="text-align:right">'+fmK(bt.adsCost||0)+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.adsRoas||0,vb,pb)+';font-weight:600">'+fmR(bt.adsRoas||0)+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.ga4Roas||0,vb,pb)+';font-weight:700">'+(bt.ga4Roas>0?fmR(bt.ga4Roas):'<span style="color:var(--muted)">&mdash;</span>')+'</td>';
+    h+='<td style="text-align:right;color:'+gC+'">'+(rawG!==0?(rawG>0?'&minus;':'+')+fmP(Math.abs(rawG)):'&mdash;')+'</td>';
+    h+='<td style="text-align:right;color:'+(wv>500?'var(--danger)':wv>50?'var(--warning)':'var(--muted)');
+    h+=';font-weight:'+(wv>1000?'700':'400')+'">'+(wv>50?fmK(wv):'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(bt.qualityScore?(bt.qualityScore*10).toFixed(1)+'/10':'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(bt.sessions>0?fmN(bt.sessions):'&mdash;')+'</td>';
+    h+='<td style="color:'+gCol+';font-weight:600;font-size:0.82rem">'+gS+'</td>';
+    h+='<td style="color:'+g4C+';font-weight:600;font-size:0.82rem">'+g4S+'</td>';
+    h+='<td>'+conflict+'</td></tr>';
   });
   h+='</tbody></table>';
-  if(dangerT.length>0){h+=abox('&#128680; <strong>Critical misalignment: '+dangerT.join(', ')+'</strong> &mdash; appear profitable to Google but loss-making on GA4. Smart bidding will keep over-scaling. See Budget Reallocation tab.','danger');}
-  var srcs=(ga4.sources||[]).slice(0,10);
-  if(srcs.length>0){
-    h+='<h3 style="margin:1.5rem 0 0.75rem;font-size:1rem;font-weight:700">Traffic Source Quality</h3><table class="table" style="width:100%"><thead><tr><th>Source / Medium</th><th style="text-align:right">Sessions</th><th style="text-align:right">CVR</th><th style="text-align:right">Revenue</th><th style="text-align:right">Bounce Rate</th></tr></thead><tbody>';
-    srcs.forEach(function(s){var ip=s.source.toLowerCase().includes('cpc')||s.source.toLowerCase().includes('paid');h+='<tr><td>'+(ip?'<span style="color:var(--gold);font-size:0.72rem">&#9679; PAID</span> ':'<span style="color:var(--muted);font-size:0.72rem">&#9675;</span> ')+s.source+'</td><td style="text-align:right">'+fmN(s.sessions)+'</td><td style="text-align:right">'+fmP(s.cvr)+'</td><td style="text-align:right">'+(s.revenue>0?fm(s.revenue):'&mdash;')+'</td><td style="text-align:right">'+fmP(s.bounceRate)+'</td></tr>';});
+
+  if(dangerT.length>0){
+    h+=abox('&#128680; <strong>Critical misalignment detected in: '+dangerT.join(', ')+'</strong> &mdash; Google\'s smart bidding algorithm is actively scaling these tiers based on phantom attributed revenue. Every &euro; of budget increase Google\'s algorithm applies to these tiers amplifies the loss. The Budget Reallocation tab shows the corrected allocation.','danger');
+  }
+
+  // Top 10 campaigns by attribution gap
+  var ga4Camps=ga4.campaigns||[];
+  var bigGapCamps=ga4Camps.filter(function(c){return c.adsCamp&&c.adsCamp.cost>100&&Math.abs(c.attributionGap)>0.1;}).sort(function(a,b){return b.attributionGap-a.attributionGap;}).slice(0,10);
+  if(bigGapCamps.length>0){
+    h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Campaigns with Largest Attribution Gaps</h3>';
+    h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">These campaigns show the largest difference between Google Ads-reported revenue and GA4-verified revenue. They are the primary sources of smart-bidding distortion.</p>';
+    h+='<table class="table" style="width:100%"><thead><tr><th>Campaign</th><th>Market</th><th>Tier</th><th style="text-align:right">Ads Spend</th><th style="text-align:right">Ads Revenue</th><th style="text-align:right">GA4 Revenue</th><th style="text-align:right">Gap%</th><th style="text-align:right">Ads ROAS</th><th style="text-align:right">GA4 ROAS</th></tr></thead><tbody>';
+    bigGapCamps.forEach(function(c){
+      var gp=c.attributionGap*100;
+      h+='<tr>';
+      h+='<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.78rem">'+c.name+'</td>';
+      h+='<td><span style="color:var(--gold);font-weight:700">'+c.market+'</span></td>';
+      h+='<td>'+tb(c.adsCamp?c.adsCamp.tier:'?')+'</td>';
+      h+='<td style="text-align:right">'+fmK(c.adsCamp?c.adsCamp.cost:0)+'</td>';
+      h+='<td style="text-align:right">'+fmK(c.adsCamp?c.adsCamp.convValue:0)+'</td>';
+      h+='<td style="text-align:right">'+fmK(c.revenue||0)+'</td>';
+      h+='<td style="text-align:right;color:'+(gp>30?'var(--danger)':gp>10?'var(--warning)':'var(--success)')+';font-weight:600">'+(gp>0?'&minus;':'')+Math.abs(gp).toFixed(0)+'%</td>';
+      h+='<td style="text-align:right;color:'+rc(c.adsCamp?(c.adsCamp.convValue/(c.adsCamp.cost||1)):0,vb,pb)+'">'+fmR(c.adsCamp?(c.adsCamp.convValue/(c.adsCamp.cost||1)):0)+'</td>';
+      h+='<td style="text-align:right;color:'+rc(c.ga4Roas||0,vb,pb)+';font-weight:600">'+(c.ga4Roas>0?fmR(c.ga4Roas):'&mdash;')+'</td>';
+      h+='</tr>';
+    });
     h+='</tbody></table>';
   }
-  h+='</div>';
 
-  // P2: BUDGET REALLOCATION ─────────────────────────────────────
+  // Source quality deep-dive
+  var srcs=(ga4.sources||[]).slice(0,12);
+  if(srcs.length>0){
+    h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Traffic Source Quality Analysis</h3>';
+    h+='<table class="table" style="width:100%"><thead><tr><th>Source / Medium</th><th>Type</th><th style="text-align:right">Sessions</th><th style="text-align:right">CVR</th><th style="text-align:right">Bounce Rate</th><th style="text-align:right">Revenue</th><th style="text-align:right">Rev/Session</th><th>Signal</th></tr></thead><tbody>';
+    var totalSrcSess=srcs.reduce(function(s,src){return s+(src.sessions||0);},0);
+    srcs.forEach(function(s){
+      var isPaid=s.source.toLowerCase().includes('cpc')||s.source.toLowerCase().includes('paid')||s.source.toLowerCase().includes('google');
+      var isOrganic=s.source.toLowerCase().includes('organic');
+      var typeLabel=isPaid?badge('PAID','var(--gold)'):isOrganic?badge('Organic','var(--success)'):badge('Other','var(--muted)');
+      var rps=s.sessions>0?(s.revenue||0)/s.sessions:0;
+      var sig=s.cvr>0.04?badge('High CVR','var(--success)'):s.cvr>0.02?badge('Avg CVR','var(--warning)'):badge('Low CVR','var(--danger)');
+      h+='<tr>';
+      h+='<td style="font-size:0.8rem">'+s.source+'</td>';
+      h+='<td>'+typeLabel+'</td>';
+      h+='<td style="text-align:right">'+fmN(s.sessions)+' '+bar((s.sessions||0)/totalSrcSess*100,'var(--gold)',4)+'</td>';
+      h+='<td style="text-align:right;font-weight:600;color:'+rc(s.cvr*30,0.5,0.9)+'">'+fmP(s.cvr)+'</td>';
+      h+='<td style="text-align:right;color:'+(s.bounceRate>0.6?'var(--danger)':s.bounceRate>0.4?'var(--warning)':'var(--success)')+'">'+fmP(s.bounceRate)+'</td>';
+      h+='<td style="text-align:right">'+(s.revenue>0?fm(s.revenue):'&mdash;')+'</td>';
+      h+='<td style="text-align:right;font-weight:600">'+(rps>1?fm(rps):'&mdash;')+'</td>';
+      h+='<td>'+sig+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+  h+='</div>'; // end P1
+
+  // ════════════════════════════════════════════════════════════
+  // P2 — BUDGET REALLOCATION ENGINE (3 scenarios + P&L)
+  // ════════════════════════════════════════════════════════════
   h+='<div id="ci-p-2" style="display:none">';
-  h+='<p style="color:var(--muted);font-size:0.84rem;margin-bottom:1.25rem">Three models: current allocation, what Google would do (attributed ROAS weight), and <strong style="color:var(--gold)">GA4 Optimal</strong> (GA4 ROAS &times; Quality Score).</p>';
+
+  // Compute per-tier: current%, Google%, GA4-optimal% + scores
   var tiersW=TORDER.filter(function(t){return byTier[t]&&(byTier[t].adsCost||0)>0;});
   var sumAR=tiersW.reduce(function(s,t){return s+(byTier[t].adsRoas||0);},0);
-  var ga4S={},sumGS=0;
-  tiersW.forEach(function(t){var bt=byTier[t];var sc=bt.ga4Roas>0?bt.ga4Roas*Math.max(0.2,bt.qualityScore||0.5):(bt.adsRoas||0)*Math.max(0.1,(bt.qualityScore||0.3))*0.35;ga4S[t]=Math.max(0,sc);sumGS+=ga4S[t];});
-  h+='<table class="table" style="width:100%;margin-bottom:1.25rem"><thead><tr><th>Tier</th><th style="text-align:right">Current<br><small style="font-weight:400;color:var(--muted)">spend/share</small></th><th style="text-align:right">Google would<br><small style="font-weight:400;color:var(--warning)">Attr ROAS weight</small></th><th style="text-align:right">GA4 Optimal<br><small style="font-weight:400;color:var(--gold)">GA4 ROAS&times;Quality</small></th><th style="text-align:right">Delta</th><th>Action</th></tr></thead><tbody>';
-  var pC=0,pG=0;
+  var ga4ScMap={}, sumGS=0, ga4PctMap={};
   tiersW.forEach(function(t){
-    var bt=byTier[t],cP=tSpend>0?(bt.adsCost||0)/tSpend:0,gP=sumAR>0?(bt.adsRoas||0)/sumAR:cP,g4P=sumGS>0?(ga4S[t]||0)/sumGS:cP;
-    var dlt=g4P-cP,dS=dlt*tSpend,useR=bt.ga4Roas>0?bt.ga4Roas:(bt.adsRoas||0)*0.55;
-    pC+=(bt.adsCost||0)*useR; pG+=g4P*tSpend*useR;
-    var dC=Math.abs(dlt)<0.015?'var(--muted)':(dlt>0?'var(--success)':'var(--danger)');
-    var act=Math.abs(dlt)<0.015?'&rarr; Keep':dlt>0.08?'&uarr;&uarr; Increase significantly':dlt>0.02?'&uarr; Increase':dlt<-0.08?'&darr;&darr; Reduce significantly':'&darr; Reduce';
-    h+='<tr><td>'+tb(t)+'</td><td style="text-align:right">'+fmK(bt.adsCost||0)+'<br>'+bar(cP*100,'var(--muted)')+'<span style="font-size:0.7rem">'+(cP*100).toFixed(1)+'%</span></td><td style="text-align:right">'+bar(gP*100,'var(--warning)')+'<span style="font-size:0.7rem">'+(gP*100).toFixed(1)+'%  '+fmK(gP*tSpend)+'</span></td><td style="text-align:right">'+bar(g4P*100,'var(--gold)')+'<span style="font-size:0.7rem">'+(g4P*100).toFixed(1)+'%  '+fmK(g4P*tSpend)+'</span></td><td style="text-align:right;color:'+dC+';font-weight:600">'+(dlt>=0?'+':'')+(dlt*100).toFixed(1)+'%<br><small>'+(dS>=0?'+':'')+fmK(dS)+'</small></td><td style="color:'+dC+';font-weight:600;font-size:0.82rem">'+act+'</td></tr>';
+    var bt=byTier[t];
+    var sc=bt.ga4Roas>0?bt.ga4Roas*Math.max(0.2,bt.qualityScore||0.5):(bt.adsRoas||0)*Math.max(0.1,(bt.qualityScore||0.3))*0.35;
+    ga4ScMap[t]=Math.max(0,sc); sumGS+=ga4ScMap[t];
   });
-  h+='</tbody></table>';
-  var upl=pG-pC;
-  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem">';
-  h+=card('Current projected revenue',fm(pC),'GA4 ROAS &times; current allocation','var(--text)');
-  h+=card('GA4-optimised projection',fm(pG),'same spend &middot; GA4-scored','var(--success)');
-  h+=card('Projected uplift',(upl>=0?'+':'')+fm(upl),'same budget &middot; reallocation only',upl>0?'var(--success)':'var(--warning)');
-  h+='</div>';
-  h+='<div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap"><button onclick="window._applyGA4BudgetWeights()" style="background:var(--gold);color:#000;border:none;padding:0.6rem 1.5rem;border-radius:6px;cursor:pointer;font-weight:700">&#127919; Apply to Budget Lab</button><span style="font-size:0.78rem;color:var(--muted)">Seeds Budget Lab tier sliders with GA4-optimal allocation</span></div>';
+  tiersW.forEach(function(t){ga4PctMap[t]=sumGS>0?(ga4ScMap[t]||0)/sumGS:0;});
+
+  // Project revenue for 3 scenarios
+  function projRevenue(blendFactor){
+    var rev=0;
+    tiersW.forEach(function(t){
+      var bt=byTier[t];
+      var curPct=tSpend>0?(bt.adsCost||0)/tSpend:0;
+      var ga4Pct=ga4PctMap[t]||0;
+      var newPct=curPct+(ga4Pct-curPct)*blendFactor;
+      var newSpend=newPct*tSpend;
+      var useR=bt.ga4Roas>0?bt.ga4Roas:(bt.adsRoas||0)*0.6;
+      rev+=newSpend*useR;
+    });
+    return rev;
+  }
+  var curProj=projRevenue(0);
+  var consProj=projRevenue(0.25);
+  var balProj=projRevenue(0.5);
+  var aggProj=projRevenue(1.0);
+
+  function projProfit(rev){ return rev*cm-tSpend; } // contribution profit estimate
+
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.25rem">';
+  h+=card('Current Projected Revenue',fm(curProj),'GA4 ROAS &times; current allocation','var(--text)');
+  h+=card('Conservative Scenario',fm(consProj),'25% shift toward GA4 optimal &rarr; '+fm(consProj-curProj)+' uplift',consProj>curProj?'var(--success)':'var(--warning)');
+  h+=card('Balanced Scenario',fm(balProj),'50% shift toward GA4 optimal &rarr; '+fm(balProj-curProj)+' uplift',balProj>curProj?'var(--success)':'var(--warning)');
+  h+=card('Aggressive Scenario',fm(aggProj),'Full GA4 reallocation &rarr; '+fm(aggProj-curProj)+' uplift',aggProj>curProj?'var(--success)':'var(--warning)');
   h+='</div>';
 
-  // P3: MARKET INTELLIGENCE ─────────────────────────────────────
-  h+='<div id="ci-p-3" style="display:none">';
-  h+='<p style="color:var(--muted);font-size:0.84rem;margin-bottom:1.25rem">Direct GA4 property data (FR=eminza.com, DE=eminza.de, ES=eminza.es, IT=eminza.it, NL=eminza.nl) vs Google Ads data per market.</p>';
-  h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr><th>Market</th><th style="text-align:right">GA4 Sessions</th><th style="text-align:right">GA4 CVR</th><th style="text-align:right">GA4 Revenue</th><th style="text-align:right">Ads Spend</th><th style="text-align:right">Ads ROAS</th><th style="text-align:right">GA4 ROAS</th><th style="text-align:right">Gap%</th><th style="text-align:right">Quality</th><th>Signal</th></tr></thead><tbody>';
-  MKTS.forEach(function(mkt){
-    var bm=byMkt[mkt]||{},mc=camps.filter(function(c){return c.market===mkt;});
-    var ms=mc.reduce(function(s,c){return s+(c.cost||0);},0),mr=mc.reduce(function(s,c){return s+(c.convValue||0);},0);
-    var mAR=ms>0?mr/ms:0,mGR=ms>0?(bm.revenue||0)/ms:0,mg=mr>0?(mr-(bm.revenue||0))/mr:0;
-    var qs=bm.qualityScore||0,sess=bm.sessions||0;
-    var sig,sigC;
-    if(!sess){sig='? No GA4 data';sigC='var(--muted)';}
-    else if(qs>0.6&&mGR>=pb){sig='&#10003; Healthy &mdash; scale';sigC='var(--success)';}
-    else if(qs>0.6&&mGR<vb){sig='&uarr; Quality OK &mdash; fix funnel';sigC='var(--warning)';}
-    else if(qs<0.4&&mGR>=vb){sig='&#9888; Good ROAS &mdash; low quality';sigC='var(--warning)';}
-    else if(qs<0.4&&mGR<vb){sig='&#128680; Loss + low quality';sigC='var(--danger)';}
-    else{sig='&rarr; Monitor';sigC='var(--text)';}
-    h+='<tr><td><strong style="color:var(--gold)">'+mkt+'</strong><br><span style="font-size:0.65rem;color:var(--muted)">'+((GA4_PROPS[mkt]||{}).domain||'')+'</span></td>';
-    h+='<td style="text-align:right">'+(sess>0?fmN(sess):'<span style="color:var(--muted)">&mdash;</span>')+'</td>';
-    h+='<td style="text-align:right">'+(sess>0?fmP(bm.cvr||0):'&mdash;')+'</td>';
-    h+='<td style="text-align:right">'+((bm.revenue||0)>0?fm(bm.revenue):'&mdash;')+'</td>';
-    h+='<td style="text-align:right">'+(ms>0?fmK(ms):'&mdash;')+'</td>';
-    h+='<td style="text-align:right;color:'+rc(mAR)+';font-weight:600">'+(ms>0?fmR(mAR):'&mdash;')+'</td>';
-    h+='<td style="text-align:right;color:'+rc(mGR)+';font-weight:600">'+(sess>0&&ms>0?fmR(mGR):'&mdash;')+'</td>';
-    h+='<td style="text-align:right;color:'+(mg>0.2?'var(--danger)':(mg>0.05?'var(--warning)':'var(--success)'))+'">'+(mr>0?(mg*100).toFixed(1)+'%':'&mdash;')+'</td>';
-    h+='<td style="text-align:right">'+(sess>0?(qs*10).toFixed(1)+'/10':'&mdash;')+'</td>';
-    h+='<td style="color:'+sigC+';font-size:0.8rem;font-weight:600">'+sig+'</td></tr>';
+  // Scenario P&L table
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Scenario P&amp;L Comparison <small style="font-weight:400;color:var(--muted)">(contribution margin '+fmP(cm)+')</small></h3>';
+  h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr><th>Scenario</th><th style="text-align:right">Projected Revenue</th><th style="text-align:right">Estimated Contribution Profit</th><th style="text-align:right">Revenue Uplift</th><th style="text-align:right">Profit Uplift</th><th style="text-align:right">Blend factor</th><th>Risk</th></tr></thead><tbody>';
+  var scenarios=[
+    {name:'Status Quo (current)',blend:0,proj:curProj,risk:'No action &mdash; wasted spend continues',rC:'var(--muted)'},
+    {name:'Conservative (25% shift)',blend:0.25,proj:consProj,risk:'Low &mdash; small repositioning',rC:'var(--success)'},
+    {name:'Balanced (50% shift)',blend:0.5,proj:balProj,risk:'Moderate &mdash; meaningful change',rC:'var(--warning)'},
+    {name:'Aggressive (full realloc)',blend:1.0,proj:aggProj,risk:'High &mdash; large tier movements',rC:'var(--danger)'}
+  ];
+  scenarios.forEach(function(sc){
+    var upl=sc.proj-curProj;
+    var profit=projProfit(sc.proj);
+    var curProfit=projProfit(curProj);
+    var profUpl=profit-curProfit;
+    h+='<tr>';
+    h+='<td><strong>'+sc.name+'</strong></td>';
+    h+='<td style="text-align:right;font-weight:600">'+fm(sc.proj)+'</td>';
+    h+='<td style="text-align:right;font-weight:600;color:'+(profit>0?'var(--success)':'var(--danger)')+'">'+fm(profit)+'</td>';
+    h+='<td style="text-align:right;color:'+(upl>0?'var(--success)':'var(--muted)')+';font-weight:600">'+(upl!==0?sgn(upl)+fm(upl):'Baseline')+'</td>';
+    h+='<td style="text-align:right;color:'+(profUpl>0?'var(--success)':'var(--muted)')+';font-weight:600">'+(profUpl!==0?sgn(profUpl)+fm(profUpl):'Baseline')+'</td>';
+    h+='<td style="text-align:right">'+(sc.blend*100).toFixed(0)+'%</td>';
+    h+='<td style="color:'+sc.rC+';font-weight:600;font-size:0.82rem">'+sc.risk+'</td>';
+    h+='</tr>';
   });
   h+='</tbody></table>';
-  var ctrs=(ga4.countries||[]).slice(0,10);
+
+  // Per-tier reallocation detail table
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Per-Tier Reallocation Detail (Balanced scenario)</h3>';
+  h+='<table class="table" style="width:100%;margin-bottom:1.25rem"><thead><tr>';
+  h+='<th>Tier</th>';
+  h+='<th style="text-align:right">Current<br><small style="font-weight:400;color:var(--muted)">spend / %</small></th>';
+  h+='<th style="text-align:right">Google Implicit<br><small style="font-weight:400;color:var(--warning)">Attr ROAS weight</small></th>';
+  h+='<th style="text-align:right">GA4 Optimal<br><small style="font-weight:400;color:var(--gold)">GA4 ROAS&times;Quality</small></th>';
+  h+='<th style="text-align:right">Balanced Target<br><small style="font-weight:400;color:var(--muted)">50% blend</small></th>';
+  h+='<th style="text-align:right">Move</th><th style="text-align:right">Revenue Impact</th><th>Action</th></tr></thead><tbody>';
+
+  tiersW.forEach(function(t){
+    var bt=byTier[t];
+    var cPct=tSpend>0?(bt.adsCost||0)/tSpend:0;
+    var gPct=sumAR>0?(bt.adsRoas||0)/sumAR:cPct;
+    var g4Pct=ga4PctMap[t]||0;
+    var balPct=cPct+(g4Pct-cPct)*0.5;
+    var dlt=balPct-cPct;
+    var dSpend=dlt*tSpend;
+    var useR=bt.ga4Roas>0?bt.ga4Roas:(bt.adsRoas||0)*0.6;
+    var revImpact=dSpend*useR;
+    var dC=Math.abs(dlt)<0.01?'var(--muted)':(dlt>0?'var(--success)':'var(--danger)');
+    var act=Math.abs(dlt)<0.01?'&rarr; No change':dlt>0.1?'&uarr;&uarr; +'+fm(Math.abs(dSpend)):dlt>0.03?'&uarr; +'+fm(Math.abs(dSpend)):dlt<-0.1?'&darr;&darr; &minus;'+fm(Math.abs(dSpend)):'&darr; &minus;'+fm(Math.abs(dSpend));
+
+    h+='<tr><td>'+tb(t)+'</td>';
+    h+='<td style="text-align:right">'+fmK(bt.adsCost||0)+'<br>'+bar(cPct*100,'var(--muted)')+'<small>'+(cPct*100).toFixed(1)+'%</small></td>';
+    h+='<td style="text-align:right">'+bar(gPct*100,'var(--warning)')+'<small>'+(gPct*100).toFixed(1)+'%  '+fmK(gPct*tSpend)+'</small></td>';
+    h+='<td style="text-align:right">'+bar(g4Pct*100,'var(--gold)')+'<small>'+(g4Pct*100).toFixed(1)+'%  '+fmK(g4Pct*tSpend)+'</small></td>';
+    h+='<td style="text-align:right">'+bar(balPct*100,'var(--text)')+'<small>'+(balPct*100).toFixed(1)+'%  '+fmK(balPct*tSpend)+'</small></td>';
+    h+='<td style="text-align:right;color:'+dC+';font-weight:700">'+(dlt>=0?'+':'')+((dlt*100).toFixed(1))+'%<br><small>'+(dSpend>=0?'+':'')+fmK(dSpend)+'</small></td>';
+    h+='<td style="text-align:right;color:'+(revImpact>0?'var(--success)':'var(--danger)')+';font-weight:600">'+(revImpact!==0?(revImpact>0?'+':'')+fm(revImpact):'&mdash;')+'</td>';
+    h+='<td style="color:'+dC+';font-weight:600;font-size:0.82rem">'+act+'</td></tr>';
+  });
+  h+='</tbody></table>';
+
+  // Smart bidding target ROAS recommendations
+  h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Recommended Smart Bidding tROAS per Tier</h3>';
+  h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Set these as Target ROAS in Google Ads to align smart bidding with GA4 reality. Apply a 15% safety margin to avoid over-constraining volume.</p>';
+  h+='<table class="table" style="width:100%"><thead><tr><th>Tier</th><th style="text-align:right">Current Ads ROAS</th><th style="text-align:right">GA4 ROAS</th><th style="text-align:right">Recommended tROAS</th><th>Rationale</th></tr></thead><tbody>';
+  tiersW.forEach(function(t){
+    var bt=byTier[t];
+    var recTRoas,rationale,rC2;
+    if(bt.ga4Roas>0){
+      // Target = GA4 ROAS × 85% safety margin, floored at breakeven
+      recTRoas=Math.max(vb*100, bt.ga4Roas*0.85*100);
+      rationale='GA4 ROAS '+fmR(bt.ga4Roas)+'x &times; 85% safety margin';
+      rC2=rc(bt.ga4Roas,vb,pb);
+    } else {
+      recTRoas=Math.max(vb*100, (bt.adsRoas||0)*0.7*100); // conservative if no GA4
+      rationale='No GA4 data &mdash; conservative 70% of Ads ROAS';
+      rC2='var(--muted)';
+    }
+    h+='<tr><td>'+tb(t)+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.adsRoas||0,vb,pb)+'">'+fmP(bt.adsRoas||0)+'</td>';
+    h+='<td style="text-align:right;color:'+rc(bt.ga4Roas||0,vb,pb)+';font-weight:700">'+(bt.ga4Roas>0?fmP(bt.ga4Roas):'&mdash;')+'</td>';
+    h+='<td style="text-align:right;font-weight:800;font-size:1rem;color:'+rC2+'">'+Math.round(recTRoas)+'%</td>';
+    h+='<td style="font-size:0.8rem;color:var(--muted)">'+rationale+'</td></tr>';
+  });
+  h+='</tbody></table>';
+
+  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:1.5rem">';
+  h+='<button onclick="window._applyGA4BudgetWeights(\'conservative\')" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:0.55rem 1.2rem;border-radius:6px;cursor:pointer;font-weight:600">&#128200; Apply Conservative (25%)</button>';
+  h+='<button onclick="window._applyGA4BudgetWeights(\'balanced\')" style="background:var(--gold);color:#000;border:none;padding:0.55rem 1.2rem;border-radius:6px;cursor:pointer;font-weight:700">&#127919; Apply Balanced (50%)</button>';
+  h+='<button onclick="window._applyGA4BudgetWeights(\'aggressive\')" style="background:var(--danger);color:#fff;border:none;padding:0.55rem 1.2rem;border-radius:6px;cursor:pointer;font-weight:700">&#9889; Apply Aggressive (100%)</button>';
+  h+='<span style="font-size:0.78rem;color:var(--muted);align-self:center">Seeds Budget Lab tier sliders &mdash; fine-tune from there</span>';
+  h+='</div>';
+  h+='</div>'; // end P2
+
+  // ════════════════════════════════════════════════════════════
+  // P3 — MARKET INTELLIGENCE (deep)
+  // ════════════════════════════════════════════════════════════
+  h+='<div id="ci-p-3" style="display:none">';
+
+  // Portfolio benchmark computations
+  var portRevPerSess=tSess>0?tGa4Rev/tSess:0;
+  var portRevPerSpend=tSpend>0?tGa4Rev/tSpend:0; // = ga4R
+  var portGa4CVR=tSess>0?tConv/tSess:0;
+
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Market Performance vs Portfolio Benchmark</h3>';
+  h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Benchmark: &euro;'+fm(portRevPerSess)+'/session, GA4 CVR '+fmP(portGa4CVR)+', GA4 ROAS '+fmR(ga4R)+'x. Percentage deltas vs portfolio average.</p>';
+  h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr>';
+  h+='<th>Market</th><th style="text-align:right">Sessions</th><th style="text-align:right">CVR<br><small style="font-weight:400;color:var(--muted)">vs benchmark</small></th>';
+  h+='<th style="text-align:right">Rev/Session<br><small style="font-weight:400;color:var(--muted)">vs benchmark</small></th>';
+  h+='<th style="text-align:right">Ads Spend</th><th style="text-align:right">Ads ROAS</th><th style="text-align:right">GA4 ROAS</th>';
+  h+='<th style="text-align:right">Quality<br>Score</th><th style="text-align:right">Share of<br>Spend</th><th>Action</th></tr></thead><tbody>';
+
+  MKTS.forEach(function(mkt){
+    var bm=byMkt[mkt]||{};
+    var mc=camps.filter(function(c){return c.market===mkt;});
+    var ms=mc.reduce(function(s,c){return s+(c.cost||0);},0);
+    var mr=mc.reduce(function(s,c){return s+(c.convValue||0);},0);
+    var mAR=ms>0?mr/ms:0, mGR=ms>0?(bm.revenue||0)/ms:0;
+    var qs=bm.qualityScore||0, sess=bm.sessions||0;
+    var mRevPerSess=sess>0?(bm.revenue||0)/sess:0;
+    var mCVR=bm.cvr||0;
+    var cvrDelta=portGa4CVR>0?(mCVR-portGa4CVR)/portGa4CVR:0;
+    var rpsDelta=portRevPerSess>0?(mRevPerSess-portRevPerSess)/portRevPerSess:0;
+    var spendShare=tSpend>0?ms/tSpend:0;
+
+    var action,aC;
+    if(!sess){action='? Await GA4 data';aC='var(--muted)';}
+    else if(mGR>=pb&&qs>=0.55&&(spendShare*MKTS.length)<1.5){action='&uarr;&uarr; Underinvested &mdash; increase share';aC='var(--success)';}
+    else if(mGR>=pb&&qs>=0.55){action='&#10003; Healthy &mdash; defend spend';aC='var(--success)';}
+    else if(mGR>=vb&&qs<0.45){action='&#8680; Fix session quality first';aC='var(--warning)';}
+    else if(mGR>=vb){action='&#8594; Maintain, improve CVR';aC='var(--warning)';}
+    else if(mGR>0&&mGR<vb&&qs>=0.5){action='&#8681; Good quality, fix ROAS';aC='var(--warning)';}
+    else if(mGR>0){action='&#128680; Below breakeven + low quality';aC='var(--danger)';}
+    else{action='? No GA4 revenue data';aC='var(--muted)';}
+
+    h+='<tr>';
+    h+='<td><strong style="color:var(--gold);font-size:1.05rem">'+mkt+'</strong><br><span style="font-size:0.65rem;color:var(--muted)">'+((GA4_PROPS[mkt]||{}).domain||'')+'</span></td>';
+    h+='<td style="text-align:right">'+(sess>0?fmN(sess):'<span style="color:var(--muted)">&mdash;</span>')+'</td>';
+    h+='<td style="text-align:right">'+(sess>0?fmP(mCVR)+'<br><small style="color:'+(cvrDelta>0?'var(--success)':'var(--danger)')+'">'+sgn(cvrDelta)+((cvrDelta*100).toFixed(0))+'%</small>':'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(sess>0?fm(mRevPerSess)+'<br><small style="color:'+(rpsDelta>0?'var(--success)':'var(--danger)')+'">'+sgn(rpsDelta)+((rpsDelta*100).toFixed(0))+'%</small>':'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(ms>0?fmK(ms):'&mdash;')+'</td>';
+    h+='<td style="text-align:right;color:'+rc(mAR,vb,pb)+';font-weight:600">'+(ms>0?fmR(mAR):'&mdash;')+'</td>';
+    h+='<td style="text-align:right;color:'+rc(mGR,vb,pb)+';font-weight:700">'+(sess>0&&ms>0?fmR(mGR):'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(sess>0?(qs*10).toFixed(1)+'/10':'&mdash;')+'</td>';
+    h+='<td style="text-align:right">'+(ms>0?fmP(spendShare)+'<br>'+bar(spendShare*100*MKTS.length,'var(--gold)'):'&mdash;')+'</td>';
+    h+='<td style="color:'+aC+';font-size:0.78rem;font-weight:600;max-width:160px">'+action+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table>';
+
+  // Market action plans
+  h+='<h3 style="margin:1.5rem 0 0.75rem;font-size:1rem;font-weight:700">Market-Level Action Plans</h3>';
+  h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:0.75rem;margin-bottom:1.5rem">';
+  MKTS.forEach(function(mkt){
+    var bm=byMkt[mkt]||{};
+    var mc=camps.filter(function(c){return c.market===mkt;});
+    var ms=mc.reduce(function(s,c){return s+(c.cost||0);},0);
+    var mr=mc.reduce(function(s,c){return s+(c.convValue||0);},0);
+    var mAR=ms>0?mr/ms:0, mGR=ms>0?(bm.revenue||0)/ms:0;
+    var qs=bm.qualityScore||0, sess=bm.sessions||0;
+    var actions=[];
+
+    if(!sess){
+      actions.push('Connect GA4 property to unlock market-level intelligence.');
+    } else {
+      if(mGR>=pb&&qs>=0.5&&ms<tSpend*0.25){actions.push('&bull; <strong>Increase budget share.</strong> ROAS and quality both exceed thresholds but spend is only '+fmP(ms/tSpend)+' of portfolio.');}
+      if(qs<0.4){actions.push('&bull; <strong>Improve landing page quality.</strong> Session quality '+( qs*10).toFixed(1)+'/10 suggests poor engagement. Review landing pages, load speed, and ad-to-page relevance.');}
+      if(mGR>0&&mGR<vb){actions.push('&bull; <strong>Reduce budget or reset tROAS to '+Math.round(vb*100)+'%+.</strong> GA4 ROAS '+fmR(mGR)+'x is below variable breakeven. Every euro spent is currently margin-negative.');}
+      if(mAR>mGR*1.5&&mGR>0){actions.push('&bull; <strong>Attribution investigation needed.</strong> Ads ROAS ('+fmR(mAR)+'x) is '+(mAR/mGR).toFixed(1)+'x higher than GA4 ROAS ('+fmR(mGR)+'x). Check for duplicate conversion tracking or incorrect attribution windows.');}
+      if(bm.cvr>0&&bm.cvr<0.015){actions.push('&bull; <strong>CVR '+fmP(bm.cvr)+' is low.</strong> Consider funnel analysis: are users reaching the checkout? Run a GA4 funnel exploration to identify the drop-off step.');}
+      if(mGR>=pb&&qs>=0.5&&mAR>0&&Math.abs(mAR-mGR)/mAR<0.15){actions.push('&bull; <strong>Strong alignment between Ads and GA4.</strong> Safe to trust Google Ads attribution for bid management in this market.');}
+      if(actions.length===0){actions.push('&bull; <strong>Monitor.</strong> Performance is within acceptable range. Review weekly.');}
+    }
+
+    var headerCol=!sess?'var(--muted)':(mGR>=pb?'var(--success)':(mGR>=vb?'var(--warning)':'var(--danger)'));
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-top:3px solid '+headerCol+';border-radius:8px;padding:1rem">';
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.6rem">';
+    h+='<span style="font-weight:800;color:var(--gold);font-size:1.1rem">'+mkt+'</span>';
+    if(sess>0){h+='<span style="font-size:0.72rem;color:var(--muted)">'+fmR(mGR)+'x GA4 &middot; '+fmP(qs)+'Q</span>';}
+    h+='</div>';
+    h+='<div style="font-size:0.8rem;line-height:1.65;color:var(--text)">'+actions.join('<br>')+'</div>';
+    h+='</div>';
+  });
+  h+='</div>';
+
+  // Top countries
+  var ctrs=(ga4.countries||[]).slice(0,12);
   if(ctrs.length>0){
     var maxCS=Math.max.apply(null,ctrs.map(function(c){return c.sessions||0;}));
-    h+='<h3 style="margin:1.5rem 0 0.75rem;font-size:1rem;font-weight:700">Top Countries (GA4)</h3><table class="table" style="width:100%"><thead><tr><th>Country</th><th style="text-align:right">Sessions</th><th style="text-align:right">CVR</th><th style="text-align:right">Revenue</th></tr></thead><tbody>';
-    ctrs.forEach(function(c){h+='<tr><td>'+c.country+'</td><td style="text-align:right">'+fmN(c.sessions)+' '+bar((c.sessions||0)/maxCS*100,'var(--gold)')+'</td><td style="text-align:right">'+fmP(c.cvr||0)+'</td><td style="text-align:right">'+((c.revenue||0)>0?fm(c.revenue):'&mdash;')+'</td></tr>';});
+    var totalCtrSess=ctrs.reduce(function(s,c){return s+(c.sessions||0);},0);
+    h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Top Countries (GA4 &middot; all markets)</h3>';
+    h+='<table class="table" style="width:100%"><thead><tr><th>Country</th><th style="text-align:right">Sessions</th><th style="text-align:right">Share</th><th style="text-align:right">CVR</th><th style="text-align:right">Revenue</th><th style="text-align:right">Rev/Session</th></tr></thead><tbody>';
+    ctrs.forEach(function(c){
+      var rps=c.sessions>0?(c.revenue||0)/c.sessions:0;
+      h+='<tr><td>'+c.country+'</td>';
+      h+='<td style="text-align:right">'+fmN(c.sessions)+' '+bar((c.sessions||0)/maxCS*100,'var(--gold)')+'</td>';
+      h+='<td style="text-align:right">'+(totalCtrSess>0?fmP(c.sessions/totalCtrSess):'&mdash;')+'</td>';
+      h+='<td style="text-align:right">'+fmP(c.cvr||0)+'</td>';
+      h+='<td style="text-align:right">'+((c.revenue||0)>0?fm(c.revenue):'&mdash;')+'</td>';
+      h+='<td style="text-align:right">'+(rps>0.1?fm(rps):'&mdash;')+'</td></tr>';
+    });
     h+='</tbody></table>';
   }
+  h+='</div>'; // end P3
+
+  // ════════════════════════════════════════════════════════════
+  // P4 — AUDIENCE & INCREMENTALITY (deep)
+  // ════════════════════════════════════════════════════════════
+  h+='<div id="ci-p-4" style="display:none">';
+  var nvr=ga4.newVsReturning||{}, nNw=nvr.new||{}, nRt=nvr.returning||{};
+  var lC=lift>30?'var(--success)':(lift>10?'var(--warning)':'var(--danger)');
+  var totalNVRSess=(nNw.sessions||0)+(nRt.sessions||0);
+
+  // ZOMBIE cost estimate
+  var zombieCost=0;
+  if(nRt.cvr>0&&nNw.cvr>0){
+    var incrementalFraction=nNw.cvr>0?(nNw.cvr-nRt.cvr)/Math.max(nNw.cvr,0.0001):0;
+    // What fraction of conversions are truly incremental?
+    // Returning users convert at retCVR regardless of ads. Only (newCVR - retCVR)/newCVR is truly incremental for new users.
+    // Ads claim all returning conversions + all new conversions. True incremental = (new conv - ret conv) = new conv × lift fraction.
+    var totalConvFromGA4=(tGa4Rev>0&&ga4R>0)?tGa4Rev/((tGa4Rev/(tSess*portfolioCVR||1)))||0:0; // rough
+    zombieCost=retS>0.5?tSpend*retS*(1-Math.max(0,lift/100))*0.5:0; // conservative estimate
+  }
+
+  // Incrementality hero section
+  h+='<div class="card" style="text-align:center;padding:2rem 1rem;margin-bottom:1.5rem;border-top:4px solid '+lC+'">';
+  h+='<div style="font-size:3rem;font-weight:800;color:'+lC+';line-height:1">'+lift.toFixed(1)+'%</div>';
+  h+='<div style="font-size:1rem;font-weight:600;margin:0.3rem 0">Implied Incremental Lift</div>';
+  var lMsg=lift>50?'Very strong. Advertising is a clear demand driver. Most conversions are attributable to ads exposure.':lift>30?'Strong. Ads are generating material incremental demand. Budget can be defended on an incrementality basis.':lift>10?'Moderate. A portion of returning-user conversions are cannibalising what would be organic revenue.':'Low or negative. The majority of conversions from returning users would very likely occur without advertising. This signals potential ZOMBIE spend at scale.';
+  h+='<div style="font-size:0.82rem;color:var(--muted);max-width:520px;margin:0.5rem auto 0;line-height:1.55">'+lMsg+'</div>';
+  h+='<div style="font-size:0.72rem;color:var(--muted);margin-top:0.5rem">Method: (New user CVR &minus; Returning user CVR) &divide; Returning user CVR. Proxy for true lift without geo holdout.</div>';
   h+='</div>';
 
-  // P4: AUDIENCE & INCREMENTALITY ───────────────────────────────
-  h+='<div id="ci-p-4" style="display:none">';
-  var nvr=ga4.newVsReturning||{},nNw=nvr.new||{},nRt=nvr.returning||{};
-  var lC=lift>30?'var(--success)':(lift>10?'var(--warning)':'var(--danger)');
-  var lM=lift>30?'Strong &mdash; ads drive genuinely incremental demand.':lift>10?'Moderate &mdash; some conversions may occur without advertising.':'Low &mdash; large share may convert without ads. ZOMBIE risk is high.';
-  h+='<div class="card" style="text-align:center;padding:2rem 1rem;margin-bottom:1.5rem;border-top:4px solid '+lC+'">';
-  h+='<div style="font-size:3rem;font-weight:800;color:'+lC+';line-height:1">'+lift.toFixed(0)+'%</div>';
-  h+='<div style="font-size:1rem;font-weight:600;margin:0.3rem 0">Implied Incremental Lift</div>';
-  h+='<div style="font-size:0.82rem;color:var(--muted);max-width:500px;margin:0.5rem auto 0">'+lM+'</div>';
-  h+='<div style="font-size:0.72rem;color:var(--muted);margin-top:0.5rem">'+fmP(retS)+' of GA4 sessions are returning users</div></div>';
-  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem">';
-  h+='<div class="card" style="flex:1;min-width:190px;border-top:3px solid var(--success)"><div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:0.4rem">NEW USERS &mdash; incremental demand</div><div style="font-size:1.4rem;font-weight:800;color:var(--success)">'+fmN(nNw.sessions||0)+'<span style="font-size:0.75rem;font-weight:400"> sess</span></div><div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-top:0.6rem"><span style="color:var(--muted)">CVR</span><strong>'+fmP(nNw.cvr||0)+'</strong></div><div style="display:flex;justify-content:space-between;font-size:0.82rem"><span style="color:var(--muted)">Revenue</span><strong>'+fm(nNw.revenue||0)+'</strong></div></div>';
-  h+='<div class="card" style="flex:1;min-width:190px;border-top:3px solid var(--warning)"><div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:0.4rem">RETURNING &mdash; would-buy-anyway baseline</div><div style="font-size:1.4rem;font-weight:800;color:var(--warning)">'+fmN(nRt.sessions||0)+'<span style="font-size:0.75rem;font-weight:400"> sess</span></div><div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-top:0.6rem"><span style="color:var(--muted)">CVR</span><strong>'+fmP(nRt.cvr||0)+'</strong></div><div style="display:flex;justify-content:space-between;font-size:0.82rem"><span style="color:var(--muted)">Revenue</span><strong>'+fm(nRt.revenue||0)+'</strong></div></div>';
-  h+='<div class="card" style="flex:1;min-width:180px"><div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:0.4rem">Returning Share</div><div style="font-size:1.4rem;font-weight:800;color:'+(retS>0.6?'var(--danger)':(retS>0.45?'var(--warning)':'var(--success)'))+'">' +fmP(retS)+'</div><div style="font-size:0.78rem;color:var(--muted);margin-top:0.6rem;margin-bottom:0.75rem">'+(retS>0.6?'&#9888; High &mdash; ZOMBIE risk':(retS>0.45?'&rarr; Monitor by tier':'&#10003; Healthy mix'))+'</div>';
-  h+='<button onclick="if(window._applyGA4Lift)window._applyGA4Lift();window.navigate(\'incrementality\')" style="font-size:0.75rem;background:var(--gold);color:#000;border:none;padding:0.35rem 0.75rem;border-radius:4px;cursor:pointer;font-weight:600">Apply to Incrementality Lab</button></div></div>';
+  // New vs Returning deep comparison
+  h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">New vs Returning: Full Breakdown</h3>';
+  h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.5rem">';
+  function nvrCard(label,seg,col){
+    var rps=seg.sessions>0?(seg.revenue||0)/seg.sessions:0;
+    return '<div class="card" style="flex:1;min-width:200px;border-top:3px solid '+col+'">'+
+      '<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:0.5rem">'+label+'</div>'+
+      '<div style="font-size:1.4rem;font-weight:800;color:'+col+'">'+fmN(seg.sessions||0)+'<span style="font-size:0.75rem;font-weight:400"> sessions</span></div>'+
+      '<div style="font-size:0.72rem;color:var(--muted);margin-bottom:0.6rem">'+(totalNVRSess>0?fmP((seg.sessions||0)/totalNVRSess)+' of total sessions':'')+'</div>'+
+      '<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">CVR</span><strong style="color:'+rc((seg.cvr||0)*30,0.5,0.9)+'">'+fmP(seg.cvr||0)+'</strong></div>'+
+      '<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">Revenue</span><strong>'+fm(seg.revenue||0)+'</strong></div>'+
+      '<div style="display:flex;justify-content:space-between;font-size:0.82rem"><span style="color:var(--muted)">Rev/session</span><strong>'+(rps>0.1?fm(rps):'&mdash;')+'</strong></div>'+
+      '</div>';
+  }
+  h+=nvrCard('NEW USERS &mdash; incremental demand',nNw,'var(--success)');
+  h+=nvrCard('RETURNING &mdash; organic baseline',nRt,'var(--warning)');
+
+  // CVR gap card
+  var cvrGap=(nNw.cvr||0)-(nRt.cvr||0);
+  var cvrGapPct=nRt.cvr>0?cvrGap/nRt.cvr:0;
+  h+='<div class="card" style="flex:1;min-width:200px">';
+  h+='<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:0.5rem">CVR Gap &amp; Returning Share</div>';
+  h+='<div style="font-size:1.4rem;font-weight:800;color:'+(retS>0.6?'var(--danger)':(retS>0.45?'var(--warning)':'var(--success)'))+'">' +fmP(retS)+'</div>';
+  h+='<div style="font-size:0.72rem;color:var(--muted);margin-bottom:0.6rem">of total GA4 sessions are returning</div>';
+  h+='<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">CVR gap</span><strong style="color:'+(cvrGap>0?'var(--success)':'var(--warning)')+'">'+sgn(cvrGap)+fmP(cvrGap)+'</strong></div>';
+  h+='<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.75rem"><span style="color:var(--muted)">Lift proxy</span><strong style="color:'+lC+'">'+lift.toFixed(1)+'%</strong></div>';
+  if(zombieCost>1000){h+='<div style="background:var(--danger)15;border-radius:4px;padding:0.4rem 0.6rem;font-size:0.75rem;color:var(--danger)">Estimated ZOMBIE spend: &euro;'+Math.round(zombieCost).toLocaleString('fr-FR')+'</div>';}
+  h+='</div>';
+  h+='</div>';
+
+  // Session quality decomposition
+  h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Session Quality Score Decomposition</h3>';
+  h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Quality score = Engagement rate (35%) + (1&minus;Bounce rate) (35%) + Duration score (30%). Minimum 0.5 required to justify scaling.</p>';
+
+  var ga4Camps2=ga4.campaigns||[];
+  if(ga4Camps2.length>0){
+    // Compute quality components by tier from campaigns
+    var tierQC={};
+    ga4Camps2.forEach(function(c){
+      if(!c.adsCamp)return;
+      var t=c.adsCamp.tier||'Unknown';
+      if(!tierQC[t])tierQC[t]={engSum:0,bounceSum:0,durSum:0,cnt:0,sessions:0};
+      var sessW=c.sessions||1;
+      // Approximation: engagement ~ (1-bounce), duration from avgDuration
+      var engScore=c.qualityScore>0?(c.qualityScore*3-((1-c.bounceRate)*0.35+Math.min(c.avgDuration/180,1)*0.30))/0.35:0;
+      var bounceScore=1-(c.bounceRate||0);
+      var durScore=Math.min((c.avgDuration||0)/180,1);
+      tierQC[t].engSum+=engScore*sessW;
+      tierQC[t].bounceSum+=bounceScore*sessW;
+      tierQC[t].durSum+=durScore*sessW;
+      tierQC[t].cnt+=sessW;
+      tierQC[t].sessions+=c.sessions||0;
+    });
+    h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr>';
+    h+='<th>Tier</th><th style="text-align:right">Sessions</th><th>Overall QS</th>';
+    h+='<th>Engagement (35%)</th><th>Bounce Score (35%)</th><th>Duration Score (30%)</th><th>CVR</th><th>Signal</th></tr></thead><tbody>';
+    TORDER.forEach(function(t){
+      var bt=byTier[t]; if(!bt||!(bt.sessions>0))return;
+      var tq=tierQC[t];
+      var eng=tq&&tq.cnt>0?tq.engSum/tq.cnt:0;
+      var bnc=tq&&tq.cnt>0?tq.bounceSum/tq.cnt:0;
+      var dur=tq&&tq.cnt>0?tq.durSum/tq.cnt:0;
+      var qs=bt.qualityScore||0;
+      var weakest=eng<bnc&&eng<dur?'engagement':(bnc<eng&&bnc<dur?'bounce rate':'session duration');
+      var sig,sigC;
+      if(qs>=0.7){sig='&#10003; Strong quality';sigC='var(--success)';}
+      else if(qs>=0.5){sig='&#8594; Acceptable &mdash; improve '+weakest;sigC='var(--warning)';}
+      else if(qs>=0.3){sig='&#9888; Weak '+weakest+' pulling QS down';sigC='var(--warning)';}
+      else{sig='&#128680; Poor quality &mdash; review '+weakest;sigC='var(--danger)';}
+      h+='<tr><td>'+tb(t)+'</td>';
+      h+='<td style="text-align:right">'+fmN(bt.sessions||0)+'</td>';
+      h+='<td>'+scoreBar(qs*100)+'</td>';
+      h+='<td>'+scoreBar(Math.min(100,eng*100))+'</td>';
+      h+='<td>'+scoreBar(Math.min(100,bnc*100))+'</td>';
+      h+='<td>'+scoreBar(Math.min(100,dur*100))+'</td>';
+      h+='<td style="text-align:right">'+fmP(bt.cvr||0)+'</td>';
+      h+='<td style="color:'+sigC+';font-size:0.8rem;font-weight:600">'+sig+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+
+  // Device journey deep-dive
   var devs=ga4.devices||[];
   if(devs.length>0){
-    var mobD=devs.find(function(d){return (d.device||'').toLowerCase().includes('mobile');}),deskD=devs.find(function(d){return (d.device||'').toLowerCase().includes('desktop');});
-    if(mobD&&deskD&&(mobD.cvr||0)>0&&(deskD.cvr||0)>0&&mobD.cvr<deskD.cvr*0.5){h+=abox('&#9888; <strong>Cross-device journey detected</strong> &mdash; Mobile CVR ('+fmP(mobD.cvr)+') &lt; half desktop CVR ('+fmP(deskD.cvr)+'). Users browse mobile, convert desktop. Mobile ROAS is understated.','warning');}
-    h+='<h3 style="margin:0 0 0.75rem;font-size:1rem;font-weight:700">Device Journey</h3><div style="display:flex;gap:0.75rem;flex-wrap:wrap">';
-    devs.forEach(function(dev){h+='<div class="card" style="flex:1;min-width:140px"><h4 style="margin:0 0 0.75rem;text-transform:capitalize;font-size:0.95rem">'+(dev.device||'Unknown')+'</h4><div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">Sessions</span><strong>'+fmN(dev.sessions||0)+'</strong></div><div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">Share</span><strong>'+fmP(dev.share||0)+'</strong></div><div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.3rem"><span style="color:var(--muted)">CVR</span><strong>'+fmP(dev.cvr||0)+'</strong></div><div style="display:flex;justify-content:space-between;font-size:0.82rem"><span style="color:var(--muted)">Bounce Rate</span><strong>'+fmP(dev.bounceRate||0)+'</strong></div>'+bar((dev.share||0)*100,'var(--gold)')+'</div>';});
+    var mobD=devs.find(function(d){return (d.device||'').toLowerCase().includes('mobile');}),
+        deskD=devs.find(function(d){return (d.device||'').toLowerCase().includes('desktop');}),
+        tabD=devs.find(function(d){return (d.device||'').toLowerCase().includes('tablet');});
+    h+='<h3 style="margin:1.5rem 0 0.5rem;font-size:1rem;font-weight:700">Device Journey &amp; Cross-Device Risk</h3>';
+
+    if(mobD&&deskD&&(mobD.cvr||0)>0&&(deskD.cvr||0)>0){
+      var crossDeviceGap=deskD.cvr/Math.max(mobD.cvr,0.001);
+      if(crossDeviceGap>2){
+        h+=abox('&#9888; <strong>Cross-device journey: '+crossDeviceGap.toFixed(1)+'x CVR gap</strong> &mdash; Desktop CVR ('+fmP(deskD.cvr)+') is '+crossDeviceGap.toFixed(1)+'x higher than mobile ('+fmP(mobD.cvr)+'). Users browse on mobile, convert on desktop. Mobile campaigns are understating their contribution. Recommendation: (1) switch to data-driven attribution in Google Ads, (2) add 7-day view-through conversion window, (3) do NOT set lower mobile bid adjustments based on last-click ROAS.','warning');
+      }
+    }
+
+    h+='<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.25rem">';
+    devs.forEach(function(dev){
+      h+='<div class="card" style="flex:1;min-width:160px">';
+      h+='<h4 style="margin:0 0 0.75rem;text-transform:capitalize;font-size:0.95rem">'+( dev.device||'Unknown')+'</h4>';
+      h+='<div style="font-size:1.25rem;font-weight:700;margin-bottom:0.25rem">'+fmP(dev.share||0)+'<span style="font-size:0.7rem;font-weight:400;color:var(--muted)"> share</span></div>';
+      h+=bar((dev.share||0)*100,'var(--gold)');
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-top:0.5rem;margin-bottom:0.25rem"><span style="color:var(--muted)">Sessions</span><strong>'+fmN(dev.sessions||0)+'</strong></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.25rem"><span style="color:var(--muted)">CVR</span><strong style="color:'+rc((dev.cvr||0)*30,0.5,0.9)+'">'+fmP(dev.cvr||0)+'</strong></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:0.82rem"><span style="color:var(--muted)">Bounce Rate</span><strong style="color:'+(dev.bounceRate>0.6?'var(--danger)':dev.bounceRate>0.4?'var(--warning)':'var(--success)')+'">'+fmP(dev.bounceRate||0)+'</strong></div>';
+      h+='</div>';
+    });
     h+='</div>';
+
+    // Device × audience matrix (estimated)
+    if(mobD&&deskD){
+      h+='<h4 style="font-size:0.9rem;font-weight:700;margin:0 0 0.5rem">Device &times; User Type Attribution Estimate</h4>';
+      h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Estimated based on device share and new/returning mix. GA4 does not directly cross-tabulate these dimensions without a custom exploration.</p>';
+      h+='<table class="table" style="width:100%;margin-bottom:1.5rem"><thead><tr><th>Segment</th><th style="text-align:right">Est. Sessions</th><th style="text-align:right">Est. CVR</th><th style="text-align:right">Est. Revenue</th><th>Incrementality signal</th></tr></thead><tbody>';
+      var mShare=mobD.share||0.5, dShare=deskD.share||0.4, tShare=tabD?tabD.share||0.1:0.1;
+      var nShare=1-retS, rShare=retS;
+      var segments=[
+        {name:'Mobile &times; New',share:mShare*nShare,cvr:(mobD.cvr||0),inc:'Most incremental &mdash; new intent on mobile'},
+        {name:'Desktop &times; New',share:dShare*nShare,cvr:(deskD.cvr||0),inc:'High value &mdash; new intent + highest CVR'},
+        {name:'Mobile &times; Returning',share:mShare*rShare,cvr:(mobD.cvr||0)*0.8,inc:'&#9888; ZOMBIE risk &mdash; would browse anyway'},
+        {name:'Desktop &times; Returning',share:dShare*rShare,cvr:(deskD.cvr||0)*0.9,inc:'&#128680; ZOMBIE risk &mdash; would convert anyway'}
+      ];
+      segments.forEach(function(seg){
+        var estSess=tSess*seg.share;
+        var estConv=estSess*seg.cvr;
+        var estRev=estConv*(tGa4Rev>0?tGa4Rev/(tSess*portfolioCVR||1):0);
+        h+='<tr><td><strong>'+seg.name+'</strong></td>';
+        h+='<td style="text-align:right">~'+fmN(Math.round(estSess))+'</td>';
+        h+='<td style="text-align:right">~'+fmP(seg.cvr)+'</td>';
+        h+='<td style="text-align:right">'+(estRev>100?'~'+fm(estRev):'&mdash;')+'</td>';
+        h+='<td style="font-size:0.8rem;color:var(--muted)">'+seg.inc+'</td></tr>';
+      });
+      h+='</tbody></table>';
+    }
   }
-  h+='</div></div>';
+
+  // Weekly incrementality trend
+  if(weekly.length>=4){
+    h+='<h3 style="margin:0 0 0.5rem;font-size:1rem;font-weight:700">Weekly Engagement Quality Trend</h3>';
+    h+='<p style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Engagement rate (engaged sessions / total sessions) as a proxy for audience quality trend. Declining engagement with growing sessions suggests lower-quality traffic acquisition.</p>';
+    h+='<table class="table" style="width:100%"><thead><tr><th>Week</th><th style="text-align:right">Sessions</th><th style="text-align:right">Conversions</th><th style="text-align:right">CVR</th><th style="text-align:right">Engaged Sessions</th><th style="text-align:right">Engagement Rate</th><th>Quality signal</th></tr></thead><tbody>';
+    weekly.slice(-10).forEach(function(w){
+      var wcvr=w.sessions>0?(w.conversions||0)/w.sessions:0;
+      var er=w.sessions>0?(w.engagedSessions||0)/w.sessions:0;
+      var qSig=er>0.55&&wcvr>0.015?badge('Strong','var(--success)'):er>0.4?badge('Moderate','var(--warning)'):badge('Weak','var(--danger)');
+      h+='<tr><td>W'+w.week+'</td>';
+      h+='<td style="text-align:right">'+fmN(w.sessions||0)+'</td>';
+      h+='<td style="text-align:right">'+fmN(w.conversions||0)+'</td>';
+      h+='<td style="text-align:right;font-weight:600;color:'+rc(wcvr*30,0.5,0.9)+'">'+fmP(wcvr)+'</td>';
+      h+='<td style="text-align:right">'+fmN(w.engagedSessions||0)+'</td>';
+      h+='<td style="text-align:right">'+fmP(er)+'</td>';
+      h+='<td>'+qSig+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+
+  h+='<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:1.5rem">';
+  h+='<button onclick="if(window._applyGA4Lift)window._applyGA4Lift();window.navigate(\'incrementality\')" style="background:var(--gold);color:#000;border:none;padding:0.55rem 1.2rem;border-radius:6px;cursor:pointer;font-weight:700">Apply to Incrementality Lab</button>';
+  h+='<button onclick="window.navigate(\'intelligence\');setTimeout(function(){window.ciTab(2);},80)" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:0.55rem 1.2rem;border-radius:6px;cursor:pointer;font-weight:600">&#8592; Budget Reallocation</button>';
+  h+='</div>';
+  h+='</div>'; // end P4
+  h+='</div>'; // end outer
+
   setMain(h);
 };
 
-// Aliases — old nav items now redirect to relevant tab
+// Backward-compatible aliases
 window.renderAttributionIntelligence = function() { window.renderCampaignIntelligence(); setTimeout(function(){ if(typeof window.ciTab==='function')window.ciTab(1); },80); };
 window.renderAudienceIntelligence    = function() { window.renderCampaignIntelligence(); setTimeout(function(){ if(typeof window.ciTab==='function')window.ciTab(4); },80); };
 
