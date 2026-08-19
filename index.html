@@ -117,17 +117,37 @@
         if (inp) inp.addEventListener('keydown', function(e) {
           if (e.key === 'Enter') doLogin();
         });
-        // Auto-boot if already authenticated
+
+        // ── URL-parameter auto-auth ──────────────────────────────────────
+        // Shareable link: https://lfhnflightstudent-maker.github.io/?share=eminza2026
         try {
-          if (sessionStorage.getItem('eminza_auth') === '1') {
+          var params = new URLSearchParams(window.location.search);
+          var shareToken = params.get('share') || params.get('access');
+          if (shareToken === PWD) {
+            // Store in localStorage so the user stays authenticated on future visits
+            localStorage.setItem('eminza_shared_auth', '1');
+            sessionStorage.setItem('eminza_auth', '1');
+            // Clean the token from the URL bar (cosmetic)
+            history.replaceState(null, '', window.location.pathname + window.location.hash);
             showApp();
+            return;
           }
         } catch(e) {}
+
+        // Auto-boot if already authenticated (session or shared-link localStorage)
+        try {
+          if (sessionStorage.getItem('eminza_auth') === '1' ||
+              localStorage.getItem('eminza_shared_auth') === '1') {
+            showApp();
+            return;
+          }
+        } catch(e) {}
+
         if (inp) inp.focus();
       });
     })();
   </script>
 
-  <script src="app.js?v=20260819-94" onerror="document.getElementById('app-content').style.display='block';document.getElementById('app-content').innerHTML='<div style=padding:2rem;color:#EF4444>⚠ Failed to load app.js — server may be down</div>'"></script>
+  <script src="app.js?v=20260819-102" onerror="document.getElementById('app-content').style.display='block';document.getElementById('app-content').innerHTML='<div style=padding:2rem;color:#EF4444>⚠ Failed to load app.js — server may be down</div>'"></script>
 </body>
 </html>
