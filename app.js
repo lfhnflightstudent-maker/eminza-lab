@@ -57345,6 +57345,1453 @@ window.refreshCategory = function() {
 // --- wow_trends.js ---
 
 // ═════════════════════════════════════════════════════════════
+
+// --- budget_lab_v2.js ---
+
+// ─────────────────────────────────────────────────────────────
+// SECTION: BUDGET OPTIMISATION LAB (v2)
+// Per-tier + per-market reallocation, presets, marginal ROIS,
+// scenario comparison, full contribution waterfall
+// ─────────────────────────────────────────────────────────────
+
+// Saved scenarios store
+window._budgetScenarios = [];
+
+function renderBudget() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const totalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const blendedROAS = totalSpend > 0 ? totalRev/totalSpend : 0;
+
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const activeTiers = TIER_ORDER.filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0));
+
+  // Initialise allocation state from current data if not set
+  if (!window._budgetAlloc || window._budgetAllocTotal !== totalSpend) {
+    window._budgetAlloc = {};
+    window._budgetAllocLocked = {};
+    window._budgetMode = 'tier'; // 'tier' or 'market'
+    activeTiers.forEach(t => {
+      const g = tierGroups.find(x=>x.key===t) || {spend:0};
+      window._budgetAlloc[t] = g.spend;
+    });
+    window._budgetAllocTotal = totalSpend;
+    window._budgetTotalOverride = null;
+    window._budgetDecay = 0.15;
+    window._budgetGM = FM.grossMargin;
+    // Market allocations
+    window._mktAlloc = {};
+    mktGroups.forEach(m => { window._mktAlloc[m.key] = m.spend; });
+  }
+
+  // Presets
+  const presets = [
+    { id:'status-quo', label:'Status Quo', icon:'◎', desc:'No changes — current allocation',
+      apply: () => {
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetTotalOverride = null;
+      }
+    },
+    { id:'zombie-50', label:'ZOMBIE +50%', icon:'⚡', desc:'Increase ZOMBIE by 50%, funded from LOW',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        const inc = zmb.spend * 0.5;
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + Math.min(inc, low.spend*0.8);
+        window._budgetAlloc['LOW']    = Math.max(0, low.spend - inc);
+      }
+    },
+    { id:'zombie-2x', label:'ZOMBIE ×2', icon:'🚀', desc:'Double ZOMBIE, funded 50% from TOP + 50% from MID',
+      apply: () => {
+        const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+        const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+        const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const needed = zmb.spend;
+        const fromTop = Math.min(needed*0.5, top.spend*0.15);
+        const fromMid = Math.min(needed*0.5, mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE'] = zmb.spend + fromTop + fromMid;
+        window._budgetAlloc['TOP']    = top.spend - fromTop;
+        window._budgetAlloc['MID']    = mid.spend - fromMid;
+      }
+    },
+    { id:'kill-low', label:'Kill LOW', icon:'💀', desc:'Move all LOW budget to ZOMBIE + MID equally',
+      apply: () => {
+        const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        window._budgetAlloc['LOW']    = 0;
+        window._budgetAlloc['ZOMBIE'] = (window._budgetAlloc['ZOMBIE']||0) + low.spend * 0.6;
+        window._budgetAlloc['MID']    = (window._budgetAlloc['MID']||0)    + low.spend * 0.4;
+      }
+    },
+    { id:'efficiency', label:'Efficiency Rank', icon:'📈', desc:'Auto-allocate by ROAS rank (highest ROAS gets proportionally more)',
+      apply: () => {
+        const tiers = activeTiers.filter(t=>t!=='BRANDING');
+        const scores = tiers.map(t=>{
+          const g = tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+          return { t, roas: g.roas, spend: g.spend };
+        });
+        const totalRoas = scores.reduce((s,x)=>s+Math.max(x.roas,0),0);
+        const budget = activeTiers.reduce((s,t)=>{
+          if(t==='BRANDING') return s;
+          return s + (tierGroups.find(g=>g.key===t)||{spend:0}).spend;
+        },0);
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        scores.forEach(({t,roas})=>{
+          window._budgetAlloc[t] = totalRoas > 0 ? (roas/totalRoas)*budget : 0;
+        });
+      }
+    },
+    { id:'nouveautes-push', label:'Nouveautés Push', icon:'🆕', desc:'Increase NOUVEAUTES by 2× from CATCH ALL',
+      apply: () => {
+        const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+        const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+        activeTiers.forEach(t => {
+          const g = tierGroups.find(x=>x.key===t)||{spend:0};
+          window._budgetAlloc[t] = g.spend;
+        });
+        const inc = Math.min(nou.spend, ca.spend * 0.3);
+        window._budgetAlloc['NOUVEAUTES'] = nou.spend + inc;
+        window._budgetAlloc['CATCH ALL']  = ca.spend  - inc;
+      }
+    },
+  ];
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Lab / Simulation</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Budget Optimisation Lab</h2>
+      </div>
+      <span class="text-muted" style="font-size:0.75rem;">Total spend: ${fmt.curK(totalSpend)} · Blended ROAS: ${fmt.roas(blendedROAS)} · Cont. ROAS: ${fmt.roas(contributionRoas(blendedROAS))}</span>
+    </div>
+
+    <div class="callout callout-error" style="margin-bottom:1rem;font-size:0.8rem;">
+      🔒 SCENARIO ONLY — READ ONLY — NO CHANGES MADE TO ANY AD SYSTEM. All figures are modelled projections. Marginal decay is assumed; actual response curves require budget variation experiments.
+    </div>
+
+    <!-- PRESET CHIPS -->
+    <div style="margin-bottom:1rem;">
+      <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;margin-bottom:0.4rem;">Quick Scenarios</div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+        ${presets.map(p=>`
+          <button class="preset-chip" id="preset-${p.id}" onclick="applyPreset('${p.id}')" title="${p.desc}">
+            ${p.icon} ${p.label}
+          </button>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- GLOBAL PARAMS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;min-width:140px;">
+        <label style="font-size:0.72rem;">Total Budget</label>
+        <input type="number" id="b-total-budget" value="${Math.round(totalSpend)}" min="0" step="10000" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div class="form-group" style="margin:0;min-width:120px;">
+        <label style="font-size:0.72rem;">Marginal Decay</label>
+        <select id="b-decay" onchange="recalcBudget();renderMarginalROIS();" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="0">None — 0%</option>
+          <option value="0.10">Low — 10%</option>
+          <option value="0.15" selected>Base — 15%</option>
+          <option value="0.25">High — 25%</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:100px;">
+        <label style="font-size:0.72rem;">GM % <span class="text-muted" style="font-weight:400;">(Group FM)</span></label>
+        <input type="number" id="b-gm" value="59" min="10" max="80" onchange="recalcBudget()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);padding-bottom:0.25rem;">
+        Net contribution margin: <strong style="color:var(--gold);">${(FM.contributionMarginAvailable*100).toFixed(1)}%</strong><br>
+        Var. BE: <strong>${fmt.roas(FM.variableBreakevenRoas)}</strong> · Profit BE: <strong>${fmt.roas(FM.profitBreakevenRoas)}</strong>
+      </div>
+    </div>
+
+    <!-- VIEW TOGGLE -->
+    <div style="display:flex;gap:0.4rem;margin-bottom:0.75rem;">
+      <button class="btn-ghost" id="view-tier-btn" onclick="setBudgetView('tier')" style="font-size:0.78rem;padding:0.25rem 0.75rem;background:var(--accent-gold);color:#000;">By Tier</button>
+      <button class="btn-ghost" id="view-mkt-btn" onclick="setBudgetView('market')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Market</button>
+      <button class="btn-ghost" id="view-camp-btn" onclick="setBudgetView('campaign')" style="font-size:0.78rem;padding:0.25rem 0.75rem;">By Campaign</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" id="view-proj-btn" onclick="showProjectionTab()" style="font-size:0.78rem;padding:0.25rem 0.75rem;border-color:var(--gold);color:var(--gold);">📅 Forward Projection W33–W52</button>
+    </div>
+
+    <!-- MAIN SPLIT: ALLOCATION + OUTPUT -->
+    <div class="budget-split">
+
+      <!-- ALLOCATION TABLE -->
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div id="alloc-table-wrap"></div>
+        <div style="padding:0.5rem 1rem;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:0.75rem;color:var(--muted);">Budget remaining: <strong id="budget-remaining" style="color:var(--success);">—</strong></span>
+          <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="resetAlloc()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- SCENARIO OUTPUT -->
+      <div class="card" id="scenario-output" style="padding:0;overflow:hidden;">
+        <div style="padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;">Projected Outcome <span class="badge" style="background:#F59E0B22;color:#F59E0B;margin-left:0.4rem;">SCENARIO</span></div>
+        </div>
+        <div id="scenario-inner" style="padding:0.75rem 1rem;">
+          <p style="color:var(--muted);font-size:0.82rem;">Adjust allocations to see projections.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- MARGINAL ROIS SECTION -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Marginal Return on Next €10K <span class="text-muted" style="font-size:0.72rem;font-weight:400;">— where should the next euro go?</span></div>
+      </div>
+      <div id="marginal-chart-wrap" style="height:160px;position:relative;"><canvas id="chart-marginal"></canvas></div>
+      <div id="marginal-table" style="margin-top:0.5rem;"></div>
+    </div>
+
+    <!-- SCENARIO COMPARISON -->
+    <div class="card" style="margin-top:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <div class="panel-head" style="margin:0;">Scenario Comparison</div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="saveScenario()">+ Save Current</button>
+      </div>
+      <div id="scenario-compare">
+        <p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>
+      </div>
+    </div>
+
+    <!-- ══ FORWARD PROJECTION ══ -->
+    <div class="card" id="proj-panel" style="margin-top:0.75rem;display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0.75rem 1rem;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Forward Projection</div>
+          <div style="font-size:0.82rem;font-weight:600;">W33–W52 2026 — Rest of Year Outlook</div>
+        </div>
+        <button class="btn-ghost" style="font-size:0.75rem;padding:0.2rem 0.6rem;" onclick="document.getElementById('proj-panel').style.display='none';refreshProjection()">✕ Close</button>
+      </div>
+      <div id="proj-content" style="padding:1rem;">
+        <div style="color:var(--muted);font-size:0.82rem;">Loading projection…</div>
+      </div>
+    </div>
+  `);
+
+  // Initialise the allocation table and run calculation
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+}
+
+// ── View toggle ───────────────────────────────────────────────
+window.setBudgetView = function(mode) {
+  window._budgetMode = mode;
+  document.getElementById('view-tier-btn').style.background = mode==='tier' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-tier-btn').style.color      = mode==='tier' ? '#000' : '';
+  document.getElementById('view-mkt-btn').style.background  = mode==='market' ? 'var(--accent-gold)' : '';
+  document.getElementById('view-mkt-btn').style.color       = mode==='market' ? '#000' : '';
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.showProjectionTab = function() {
+  const panel = document.getElementById('proj-panel');
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = isHidden ? 'block' : 'none';
+  const btn = document.getElementById('view-proj-btn');
+  if (btn) {
+    btn.style.background = isHidden ? 'var(--gold)' : '';
+    btn.style.color      = isHidden ? '#000' : 'var(--gold)';
+  }
+  if (isHidden) {
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 100);
+  }
+};
+
+// Re-run projection when budget changes (if panel is open)
+function maybeRefreshProjection() {
+  const panel = document.getElementById('proj-panel');
+  if (panel && panel.style.display !== 'none') {
+    setTimeout(() => {
+      if (typeof window.renderForwardProjection === 'function') window.renderForwardProjection();
+    }, 200);
+  }
+}
+
+// ── Allocation table ──────────────────────────────────────────
+function renderAllocTable() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const totalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const newTotal   = parseFloat(document.getElementById('b-total-budget')?.value||totalSpend);
+  const mode = window._budgetMode || 'tier';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+
+  // Campaign mode — delegate entirely
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+    return;
+  }
+
+  const items = mode === 'tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0))
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0}; return {key:t,spend:g.spend,roas:g.roas,type:'tier'}; })
+    : mktGroups.map(m=>({key:m.key,spend:m.spend,roas:m.roas,type:'market'}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  const allocTotal = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const budgetRemaining = newTotal - allocTotal;
+  const remEl = document.getElementById('budget-remaining');
+  if (remEl) {
+    remEl.textContent = fmt.curK(budgetRemaining);
+    remEl.style.color = Math.abs(budgetRemaining) < newTotal*0.02 ? 'var(--success)' : 'var(--warning)';
+  }
+
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="cockpit-table" style="width:100%;">
+      <thead>
+        <tr>
+          <th>${mode==='tier'?'Tier':'Market'}</th>
+          <th>Current</th>
+          <th>Curr. ROAS</th>
+          <th>New Budget</th>
+          <th>Change</th>
+          <th>🔒</th>
+          ${mode==='tier' ? '<th style="width:32px;"></th>' : ''}
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(item => {
+          const newSpend = allocObj[item.key] ?? item.spend;
+          const delta = newSpend - item.spend;
+          const locked = window._budgetAllocLocked[item.key];
+          const expanded = mode==='tier' && window._campExpanded[item.key];
+          const campCount = mode==='tier' ? camps.filter(c=>(c.tier||'OTHER')===item.key&&c.cost>0).length : 0;
+          const changedN  = mode==='tier' ? changedCountForTier(item.key) : 0;
+          const rowStyle  = changedN > 0 ? 'background:rgba(201,168,76,0.05);' : '';
+          return `<tr style="${rowStyle}">
+            <td>${mode==='tier'?tierBadge(item.key):mktBadge(item.key)}
+              ${mode==='tier'&&campCount ? `<span style="font-size:0.65rem;color:var(--muted);margin-left:0.3rem">${campCount}↓</span>` : ''}
+              ${changedN ? `<span style="font-size:0.65rem;color:var(--warning);margin-left:0.2rem">⚡${changedN}</span>` : ''}
+            </td>
+            <td style="color:var(--muted)">${fmt.curK(item.spend)}</td>
+            <td style="color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="padding:0.15rem 0.4rem;">
+              <input type="number" class="alloc-input" value="${Math.round(newSpend)}" min="0" step="1000"
+                data-tier="${item.key}" data-mode="${mode}"
+                style="width:80px;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:0.2rem 0.35rem;font-size:0.8rem;color:var(--text);"
+                ${locked?'disabled':''} onchange="updateAlloc('${item.key}','${mode}',this.value)">
+            </td>
+            <td style="color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};font-weight:600;">
+              ${delta>1?'+':delta<-1?'-':''}${fmt.curK(Math.abs(delta))}
+            </td>
+            <td><button onclick="toggleLock('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.9rem;color:${locked?'var(--warning)':'var(--muted)'}" title="${locked?'Unlock':'Lock'}">${locked?'🔒':'🔓'}</button></td>
+            ${mode==='tier' ? `<td style="text-align:center;"><button onclick="toggleTierExpand('${item.key}')" style="background:none;border:none;cursor:pointer;font-size:0.75rem;color:var(--muted);padding:0.1rem 0.3rem;" title="Expand campaigns">${expanded?'▼':'▶'}</button></td>` : ''}
+          </tr>
+          ${mode==='tier' ? (typeof renderTierExpandRows === 'function' ? renderTierExpandRows(item.key, camps, decay) : '') : ''}`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border);font-weight:700;">
+          <td>Total</td>
+          <td style="color:var(--muted)">${fmt.curK(totalSpend)}</td>
+          <td></td>
+          <td style="color:${Math.abs(budgetRemaining)<newTotal*0.02?'var(--success)':'var(--warning)'}">
+            ${fmt.curK(allocTotal)}
+          </td>
+          <td style="color:${budgetRemaining>0?'var(--success)':budgetRemaining<0?'var(--danger)':'var(--muted)'}">
+            ${budgetRemaining>0?'+':''}${fmt.curK(budgetRemaining)}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  `;
+}
+
+// ── Allocation helpers ────────────────────────────────────────
+window.updateAlloc = function(key, mode, val) {
+  const obj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+  obj[key] = parseFloat(val)||0;
+  renderAllocTable();
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.toggleLock = function(key) {
+  window._budgetAllocLocked[key] = !window._budgetAllocLocked[key];
+  renderAllocTable();
+};
+
+window.resetAlloc = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  mktGroups.forEach(m=>{ window._mktAlloc[m.key]=m.spend; });
+  window._budgetAllocLocked = {};
+  document.getElementById('b-total-budget').value = Math.round(camps.reduce((s,c)=>s+c.cost,0));
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+};
+
+window.applyPreset = function(id) {
+  // Highlight active preset
+  document.querySelectorAll('.preset-chip').forEach(el=>el.classList.remove('active'));
+  const btn = document.getElementById('preset-'+id);
+  if (btn) btn.classList.add('active');
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps,'tier');
+  // Reset first
+  tierGroups.forEach(g=>{ window._budgetAlloc[g.key]=g.spend; });
+  // Find and apply preset
+  const preset = (function(){
+    const zmb = tierGroups.find(g=>g.key==='ZOMBIE')||{spend:0};
+    const low = tierGroups.find(g=>g.key==='LOW')||{spend:0};
+    const mid = tierGroups.find(g=>g.key==='MID')||{spend:0};
+    const top = tierGroups.find(g=>g.key==='TOP')||{spend:0};
+    const nou = tierGroups.find(g=>g.key==='NOUVEAUTES')||{spend:0};
+    const ca  = tierGroups.find(g=>g.key==='CATCH ALL')||{spend:0};
+    const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+    switch(id) {
+      case 'zombie-50': {
+        const inc = Math.min(zmb.spend*0.5, low.spend*0.8);
+        window._budgetAlloc['ZOMBIE']=(zmb.spend+inc);
+        window._budgetAlloc['LOW']=Math.max(0,low.spend-inc);
+        break;
+      }
+      case 'zombie-2x': {
+        const fromTop=Math.min(zmb.spend*0.5,top.spend*0.15);
+        const fromMid=Math.min(zmb.spend*0.5,mid.spend*0.3);
+        window._budgetAlloc['ZOMBIE']=zmb.spend+fromTop+fromMid;
+        window._budgetAlloc['TOP']=top.spend-fromTop;
+        window._budgetAlloc['MID']=mid.spend-fromMid;
+        break;
+      }
+      case 'kill-low': {
+        window._budgetAlloc['LOW']=0;
+        window._budgetAlloc['ZOMBIE']=(window._budgetAlloc['ZOMBIE']||zmb.spend)+low.spend*0.6;
+        window._budgetAlloc['MID']=(window._budgetAlloc['MID']||mid.spend)+low.spend*0.4;
+        break;
+      }
+      case 'efficiency': {
+        const tiers=TIER_ORDER.filter(t=>t!=='BRANDING'&&tierGroups.find(g=>g.key===t&&g.spend>0));
+        const budget=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{spend:0}).spend+s,0);
+        const totalR=tiers.reduce((s,t)=>(tierGroups.find(g=>g.key===t)||{roas:0}).roas+s,0);
+        tiers.forEach(t=>{ window._budgetAlloc[t]=totalR>0?((tierGroups.find(g=>g.key===t)||{roas:0}).roas/totalR)*budget:0; });
+        break;
+      }
+      case 'nouveautes-push': {
+        const inc=Math.min(nou.spend,ca.spend*0.3);
+        window._budgetAlloc['NOUVEAUTES']=nou.spend+inc;
+        window._budgetAlloc['CATCH ALL']=ca.spend-inc;
+        break;
+      }
+      // status-quo: already reset above
+    }
+  })();
+  renderAllocTable();
+  recalcBudget();
+  renderMarginalROIS();
+  renderScenarioCompare();
+};
+
+// ── Main calculation ──────────────────────────────────────────
+window.recalcBudget = function() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const mktGroups  = groupBy(camps, 'market').sort((a,b)=>b.spend-a.spend).filter(m=>m.spend>0);
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netContrib = Math.max(0, gm - FM.totalVariableExAds);
+  const mode  = window._budgetMode || 'tier';
+
+  const currentTotalSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const currentTotalRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const newTotalBudget    = parseFloat(document.getElementById('b-total-budget')?.value||currentTotalSpend);
+
+  // Build per-item deltas
+  const items = mode==='tier'
+    ? ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING']
+        .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0) || (window._budgetAlloc[t]||0)>0)
+        .map(t=>{ const g=tierGroups.find(x=>x.key===t)||{spend:0,roas:0,revenue:0}; return {key:t,curSpend:g.spend,curRoas:g.roas,curRev:g.revenue||g.roas*g.spend}; })
+    : mktGroups.map(m=>({key:m.key,curSpend:m.spend,curRoas:m.roas,curRev:m.revenue||m.roas*m.spend}));
+
+  const allocObj = mode==='tier' ? window._budgetAlloc : window._mktAlloc;
+
+  let totalDeltaRev = 0;
+  const rows = [];
+
+  items.forEach(item => {
+    const newSpend = allocObj[item.key] ?? item.curSpend;
+    const deltaSpend = newSpend - item.curSpend;
+    let projRev, projRoas;
+
+    if (Math.abs(deltaSpend) < 1) {
+      // No change
+      projRev  = item.curRev;
+      projRoas = item.curRoas;
+    } else if (deltaSpend > 0) {
+      // Increase: base keeps current ROAS, incremental gets decayed
+      const baseRev  = item.curRev;
+      const incrRev  = deltaSpend * item.curRoas * (1 - decay);
+      projRev  = baseRev + incrRev;
+      projRoas = newSpend > 0 ? projRev / newSpend : item.curRoas;
+    } else {
+      // Decrease: assume proportional revenue loss (conservative)
+      projRev  = newSpend > 0 ? item.curRev * (newSpend / item.curSpend) : 0;
+      projRoas = item.curRoas; // ROAS roughly stable on reduction
+    }
+
+    const deltaRev = projRev - item.curRev;
+    totalDeltaRev += deltaRev;
+    rows.push({ ...item, newSpend, deltaSpend, projRev, projRoas, deltaRev });
+  });
+
+  const newTotalRev   = currentTotalRev + totalDeltaRev;
+  const allocTotal    = Object.values(allocObj).reduce((s,v)=>s+v,0);
+  const newRoas       = allocTotal > 0 ? newTotalRev / allocTotal : 0;
+  const newContribR   = contributionRoas(newRoas);
+  const deltaContrib  = totalDeltaRev * netContrib;
+  const hasChanges    = rows.some(r => Math.abs(r.deltaSpend) > 0.5);
+
+  // Render output — always show, even at status quo
+  const el = document.getElementById('scenario-inner');
+  if (!el) return;
+
+  const beStatus = newContribR >= FM.profitBreakevenRoas
+    ? `<span style="color:var(--success)">✓ Above profitability threshold (${fmt.roas(FM.profitBreakevenRoas)})</span>`
+    : newContribR >= 1.0
+      ? `<span style="color:var(--warning)">⚠ Above variable BE but not yet fully profitable</span>`
+      : `<span style="color:var(--danger)">✗ Below variable break-even — destroying contribution</span>`;
+
+  const changedRows   = rows.filter(r => Math.abs(r.deltaSpend) > 0.5);
+  const budgetDelta   = allocTotal - currentTotalSpend;
+
+  el.innerHTML = `
+    <!-- BEFORE / AFTER SUMMARY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;">
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">Current</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--text)">${fmt.curK(currentTotalRev)}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(currentTotalRev/currentTotalSpend)}</div>
+      </div>
+      <div style="background:var(--surface);border-radius:6px;padding:0.6rem;border:1px solid ${totalDeltaRev>=0?'rgba(201,168,76,0.2)':'rgba(239,68,68,0.2)'};">
+        <div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem;">${hasChanges ? 'Projected' : 'Status Quo'}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${hasChanges?(totalDeltaRev>0?'var(--success)':'var(--danger)'):'var(--text)'}">${fmt.curK(newTotalRev)} ${hasChanges?`<span style="font-size:0.75rem">(${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)})</span>`:''}</div>
+        <div style="font-size:0.75rem;color:var(--muted)">Revenue · ROAS ${fmt.roas(newRoas)}</div>
+      </div>
+    </div>
+
+    <!-- CHANGED TIERS/MARKETS -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Changes</div>
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;margin-bottom:0.6rem;">
+      <thead><tr style="color:var(--muted);font-size:0.7rem;">
+        <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">${mode==='tier'?'Tier':'Market'}</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Budget</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Proj. ROAS</th>
+        <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Revenue</th>
+      </tr></thead>
+      <tbody>
+        ${changedRows.map(r=>`
+          <tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${mode==='tier'?tierBadge(r.key):mktBadge(r.key)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaSpend>0?'var(--success)':'var(--danger)'};">${r.deltaSpend>0?'+':''}${fmt.curK(r.deltaSpend)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(r.projRoas)};font-weight:600;">${fmt.roas(r.projRoas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${r.deltaRev>0?'var(--success)':'var(--danger)'};">${r.deltaRev>0?'+':''}${fmt.curK(r.deltaRev)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- CONTRIBUTION WATERFALL -->
+    <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">Contribution Waterfall (base)</div>
+    <div class="scenario-grid" style="font-size:0.8rem;">
+      <div class="scenario-row"><span>&Delta; Revenue</span><span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</span></div>
+      <div class="scenario-row"><span>&Delta; Gross profit <span style="color:var(--muted);font-size:0.7rem">(&times;${(gm*100).toFixed(0)}% GM)</span></span><span style="color:${totalDeltaRev*gm>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*gm>0?'+':''}${fmt.curK(totalDeltaRev*gm)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Returns <span style="color:var(--muted);font-size:0.7rem">(${(FM.returnsRate*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*FM.returnsRate)}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Logistics+shipping <span style="color:var(--muted);font-size:0.7rem">(${((FM.variableLogistics+FM.shippingCost)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.variableLogistics+FM.shippingCost))}</span></div>
+      <div class="scenario-row"><span style="padding-left:0.75rem">&minus; Other variable <span style="color:var(--muted);font-size:0.7rem">(${((FM.directSales+FM.rfa)*100).toFixed(1)}%)</span></span><span style="color:var(--danger)">&minus;${fmt.curK(totalDeltaRev*(FM.directSales+FM.rfa))}</span></div>
+      <div class="scenario-row" style="font-weight:700;border-top:1px solid var(--border);padding-top:0.35rem;margin-top:0.1rem;"><span>&Delta; Net contribution <span style="color:var(--muted);font-size:0.7rem">(${(netContrib*100).toFixed(1)}%)</span></span><span style="color:${deltaContrib>0?'var(--success)':'var(--danger)'}">${deltaContrib>0?'+':''}${fmt.curK(deltaContrib)}</span></div>
+      ${budgetDelta !== 0 ? `<div class="scenario-row"><span>&Delta; Budget <span style="color:var(--muted);font-size:0.7rem">(net new investment)</span></span><span style="color:${budgetDelta>0?'var(--danger)':'var(--success)'}">${budgetDelta>0?'+':''}${fmt.curK(budgetDelta)}</span></div>` : ''}
+      <div style="border-top:1px solid var(--border);margin:0.3rem 0;"></div>
+      <div class="scenario-row"><span>New Att. ROAS</span><span style="color:${roasColor(newRoas)}">${fmt.roas(newRoas)}</span></div>
+      <div class="scenario-row" style="font-weight:700;"><span>New Contribution ROAS</span><span style="color:${contRoasColor(newContribR)}">${fmt.roas(newContribR)} <span style="color:var(--muted);font-size:0.7rem">var.BE ${fmt.roas(FM.variableBreakevenRoas)}</span></span></div>
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.78rem;">${beStatus}</div>
+    <div style="margin-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem;">Revenue range (low / base / high)</div>
+      <div style="display:flex;gap:0.4rem;">
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Low (×0.7)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*0.7>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*0.7>0?'+':''}${fmt.curK(totalDeltaRev*0.7)}</div>
+        </div>
+        <div style="flex:1;background:var(--accent-gold)11;border:1px solid var(--accent-gold)44;border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">Base</div>
+          <div style="font-size:0.85rem;font-weight:700;color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}">${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)}</div>
+        </div>
+        <div style="flex:1;background:var(--surface);border-radius:4px;padding:0.4rem;text-align:center;">
+          <div style="font-size:0.65rem;color:var(--muted)">High (×1.3)</div>
+          <div style="font-size:0.85rem;font-weight:600;color:${totalDeltaRev*1.3>0?'var(--success)':'var(--danger)'}">${totalDeltaRev*1.3>0?'+':''}${fmt.curK(totalDeltaRev*1.3)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top:0.75rem;font-size:0.75rem;">
+      Confidence: Low. Decay (${(decay*100).toFixed(0)}%) applied only to incremental spend. Response curve unknown without spend variation tests.
+    </div>
+    ${typeof getCampaignChangeSummary === 'function' ? getCampaignChangeSummary() : ''}
+  `;
+};
+
+// ── Marginal ROIS ─────────────────────────────────────────────
+function renderMarginalROIS() {
+  const camps = filteredCampaigns();
+  const tierGroups = groupBy(camps, 'tier');
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const netC  = Math.max(0, gm - FM.totalVariableExAds);
+  const TIER_ORDER = ['TOP','TOP SEASONAL','CATCH ALL','MID','LOW','ZOMBIE','NOUVEAUTES','BRANDING'];
+  const incr = 10000; // €10K
+
+  const items = TIER_ORDER
+    .filter(t=>tierGroups.find(g=>g.key===t&&g.spend>0)&&t!=='BRANDING')
+    .map(t=>{
+      const g=tierGroups.find(x=>x.key===t)||{roas:0,spend:0};
+      const marginalRev  = incr * g.roas * (1-decay);
+      const marginalContrib = marginalRev * netC;
+      return { t, roas:g.roas, marginalRev, marginalContrib };
+    })
+    .sort((a,b)=>b.marginalContrib-a.marginalContrib);
+
+  const wrap = document.getElementById('marginal-chart-wrap');
+  if (wrap) {
+    makeChart('chart-marginal','bar',
+      items.map(i=>i.t),
+      [{
+        label:`Net contribution per €${fmt.curK(incr)} incremental`,
+        data: items.map(i=>i.marginalContrib),
+        backgroundColor: items.map(i=>TIER_COLORS[i.t]||'#6B7280'),
+        borderRadius:3,borderWidth:0
+      }],
+      {scales:{y:{ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(1)+'K'},grid:{color:'rgba(255,255,255,0.04)'}},x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.04)'}}}},
+    );
+  }
+
+  const tbl = document.getElementById('marginal-table');
+  if (tbl) {
+    tbl.innerHTML = `
+      <table style="width:100%;font-size:0.77rem;border-collapse:collapse;">
+        <thead><tr style="color:var(--muted);">
+          <th style="text-align:left;padding:0.2rem 0.4rem 0.3rem 0;">Tier</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Curr. ROAS</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Marginal Rev. per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Net Contribution per €10K</th>
+          <th style="text-align:right;padding:0.2rem 0.4rem;">Priority</th>
+        </tr></thead>
+        <tbody>
+          ${items.map((item,i)=>`<tr>
+            <td style="padding:0.2rem 0.4rem 0.2rem 0;">${tierBadge(item.t)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(item.roas)};font-weight:600;">${fmt.roas(item.roas)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">${fmt.curK(item.marginalRev)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;font-weight:600;color:${item.marginalContrib>0?'var(--success)':'var(--danger)'};">${fmt.curK(item.marginalContrib)}</td>
+            <td style="text-align:right;padding:0.2rem 0.4rem;">
+              ${i===0?'<span style="color:var(--gold);font-weight:700;">★ Best</span>':i===1?'<span style="color:var(--muted);">2nd</span>':'<span style="color:var(--muted);">'+i+1+'th</span>'}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.4rem;">
+        Based on ${(decay*100).toFixed(0)}% marginal decay assumption applied to each tier's current ROAS. ZOMBIE's ranking here supports the underfunding hypothesis.
+      </p>
+    `;
+  }
+}
+
+// ── Scenario comparison ───────────────────────────────────────
+window.saveScenario = function() {
+  const camps = filteredCampaigns();
+  const decay = parseFloat(document.getElementById('b-decay')?.value||0.15);
+  const gm    = parseFloat(document.getElementById('b-gm')?.value||59)/100;
+  const allocSnap = {...(window._budgetMode==='tier'?window._budgetAlloc:window._mktAlloc)};
+  const label = prompt('Scenario name:', 'Scenario ' + (window._budgetScenarios.length+1));
+  if (!label) return;
+  window._budgetScenarios.push({ label, alloc:allocSnap, decay, gm, mode:window._budgetMode });
+  if (window._budgetScenarios.length > 3) window._budgetScenarios.shift();
+  renderScenarioCompare();
+};
+
+function renderScenarioCompare() {
+  const el = document.getElementById('scenario-compare');
+  if (!el) return;
+  if (!window._budgetScenarios.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:0.8rem;">Save scenarios above to compare side-by-side (up to 3).</p>';
+    return;
+  }
+  const camps = filteredCampaigns();
+  const curSpend = camps.reduce((s,c)=>s+c.cost,0);
+  const curRev   = camps.reduce((s,c)=>s+c.convValue,0);
+  const tierGroups = groupBy(camps,'tier');
+  const mktGroups  = groupBy(camps,'market').sort((a,b)=>b.spend-a.spend);
+
+  function calcScenario(sc) {
+    const netC = Math.max(0, sc.gm - FM.totalVariableExAds);
+    let totalDeltaRev=0, totalNewSpend=0;
+    const items = sc.mode==='tier'
+      ? Object.keys(sc.alloc).map(k=>({key:k,...(tierGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}))
+      : Object.keys(sc.alloc).map(k=>({key:k,...(mktGroups.find(g=>g.key===k)||{spend:0,roas:0,revenue:0})}));
+    items.forEach(item=>{
+      const newSp=sc.alloc[item.key]??item.spend;
+      totalNewSpend+=newSp;
+      const dSp=newSp-item.spend;
+      if(dSp>0) totalDeltaRev+=dSp*item.roas*(1-sc.decay);
+      else if(dSp<0) totalDeltaRev+=item.spend>0?item.revenue*(newSp/item.spend)-item.revenue:0;
+    });
+    const newRev=curRev+totalDeltaRev;
+    const newR=totalNewSpend>0?newRev/totalNewSpend:0;
+    const contrib=totalDeltaRev*netC;
+    return {newRev,newR,contrib,totalNewSpend,deltaRev:totalDeltaRev};
+  }
+
+  const cols = window._budgetScenarios.map(sc=>({...sc,...calcScenario(sc)}));
+
+  el.innerHTML = `
+    <table style="width:100%;font-size:0.78rem;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:0.25rem 0.4rem;color:var(--muted);">Metric</th>
+        <th style="padding:0.25rem 0.4rem;color:var(--muted);">Current</th>
+        ${cols.map(c=>`<th style="padding:0.25rem 0.4rem;color:var(--gold);">${c.label}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Spend</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.totalNewSpend>curSpend?'var(--danger)':'var(--muted)'}">${fmt.curK(c.totalNewSpend)}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">Total Revenue</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem">${fmt.curK(curRev)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.newRev>curRev?'var(--success)':'var(--danger)'}">${fmt.curK(c.newRev)} <span style="font-size:0.7rem">(${c.deltaRev>0?'+':''}${fmt.curK(c.deltaRev)})</span></td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Att. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(curRev/curSpend)}">${fmt.roas(curRev/curSpend)}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${roasColor(c.newR)}">${fmt.roas(c.newR)}</td>`).join('')}
+        </tr>
+        <tr style="font-weight:600;"><td style="padding:0.25rem 0.4rem;color:var(--muted)">Cont. ROAS</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(curRev/curSpend))}">${fmt.roas(contributionRoas(curRev/curSpend))}</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${contRoasColor(contributionRoas(c.newR))}">${fmt.roas(contributionRoas(c.newR))}</td>`).join('')}
+        </tr>
+        <tr><td style="padding:0.25rem 0.4rem;color:var(--muted)">&Delta; Net Contribution</td>
+          <td style="text-align:center;padding:0.25rem 0.4rem;color:var(--muted)">—</td>
+          ${cols.map(c=>`<td style="text-align:center;padding:0.25rem 0.4rem;color:${c.contrib>0?'var(--success)':'var(--danger)'}">${c.contrib>0?'+':''}${fmt.curK(c.contrib)}</td>`).join('')}
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:0.4rem;text-align:right;">
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.15rem 0.5rem;" onclick="window._budgetScenarios=[];renderScenarioCompare()">Clear all</button>
+    </div>
+  `;
+}
+
+window.recalcBudget = window.recalcBudget;
+
+
+
+// --- campaign_budget.js ---
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CAMPAIGN-LEVEL BUDGET ENGINE  —  campaign_budget.js
+// Edit budgets at individual campaign level → rolls up to tier → outcome
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+// Per-campaign overrides (campaignKey → newBudget in €)
+window._campAlloc    = window._campAlloc    || {};
+window._campExpanded = window._campExpanded || {}; // tier → bool (expanded in tier view)
+window._campSearch   = '';
+window._campSortKey  = 'spend';
+window._campSortDir  = -1; // -1 = desc
+
+// Sync campaign-level overrides up to tier-level _budgetAlloc
+function syncTierFromCampaigns() {
+  const all = window.EMINZA.campaigns || [];
+  const tierTotals = {};
+  all.forEach(c => {
+    const key = c.name || c.campaign;
+    const budget = window._campAlloc[key] !== undefined ? window._campAlloc[key] : c.cost;
+    const tier = c.tier || 'OTHER';
+    tierTotals[tier] = (tierTotals[tier] || 0) + budget;
+  });
+  // Update _budgetAlloc so recalcBudget() sees the campaign changes
+  Object.entries(tierTotals).forEach(([t, v]) => {
+    window._budgetAlloc[t] = v;
+  });
+}
+
+// How many campaigns in a tier have been changed
+function changedCountForTier(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier || 'OTHER') === tier);
+  return camps.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  }).length;
+}
+
+// ── "By Campaign" full table ─────────────────────────────────────────────────
+
+window.renderCampaignBudgetTable = function() {
+  const wrap = document.getElementById('alloc-table-wrap');
+  if (!wrap) return;
+
+  const all = (window.EMINZA.campaigns || []).filter(c => c.cost > 0);
+  const search = (window._campSearch || '').toLowerCase();
+  const tierFilter = document.getElementById('camp-tier-filter')?.value || 'ALL';
+  const mktFilter  = document.getElementById('camp-mkt-filter')?.value  || 'ALL';
+
+  let rows = all;
+  if (search) rows = rows.filter(c => (c.name||'').toLowerCase().includes(search));
+  if (tierFilter !== 'ALL') rows = rows.filter(c => (c.tier||'OTHER') === tierFilter);
+  if (mktFilter  !== 'ALL') rows = rows.filter(c => c.market === mktFilter);
+
+  // Sort
+  const sk = window._campSortKey;
+  const sd = window._campSortDir;
+  rows = [...rows].sort((a, b) => {
+    const av = sk === 'roas' ? a.roas : sk === 'delta' ? (window._campAlloc[a.name||a.campaign]||a.cost) - a.cost : a.cost;
+    const bv = sk === 'roas' ? b.roas : sk === 'delta' ? (window._campAlloc[b.name||b.campaign]||b.cost) - b.cost : b.cost;
+    return (av - bv) * sd;
+  });
+
+  const totalNew   = all.reduce((s,c) => s + (window._campAlloc[c.name||c.campaign] ?? c.cost), 0);
+  const totalCurr  = all.reduce((s,c) => s + c.cost, 0);
+  const changedN   = all.filter(c => window._campAlloc[c.name||c.campaign] !== undefined && Math.abs(window._campAlloc[c.name||c.campaign] - c.cost) > 0.5).length;
+
+  const thStyle = k => `style="text-align:right;padding:0.3rem 0.5rem;cursor:pointer;white-space:nowrap;color:${window._campSortKey===k?'var(--gold)':'var(--muted)'};font-size:0.7rem;"`;
+  const th = (label, key) => `<th ${thStyle(key)} onclick="campSort('${key}')">${label}${window._campSortKey===key?(window._campSortDir>0?' ▲':' ▼'):''}</th>`;
+
+  const tiers   = [...new Set(all.map(c => c.tier||'OTHER'))].sort();
+  const markets = [...new Set(all.map(c => c.market||''))].filter(Boolean).sort();
+
+  wrap.innerHTML = `
+    <div style="padding:0.6rem 1rem;border-bottom:1px solid var(--border);display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);">
+      <input id="camp-search" type="text" placeholder="🔍 Search campaigns…" value="${window._campSearch}"
+        oninput="window._campSearch=this.value;renderCampaignBudgetTable()"
+        style="flex:1;min-width:160px;padding:0.3rem 0.6rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;font-size:0.78rem;color:var(--text);">
+      <select id="camp-tier-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Tiers</option>
+        ${tiers.map(t => `<option value="${t}" ${tierFilter===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <select id="camp-mkt-filter" onchange="renderCampaignBudgetTable()"
+        style="padding:0.3rem 0.5rem;font-size:0.78rem;background:var(--card-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+        <option value="ALL">All Markets</option>
+        ${markets.map(m => `<option value="${m}" ${mktFilter===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <span style="font-size:0.72rem;color:var(--muted)">${rows.length} campaigns</span>
+      ${changedN > 0 ? `<span style="font-size:0.72rem;color:var(--warning);font-weight:600">⚡ ${changedN} changed</span>` : ''}
+      <button class="btn-ghost" style="font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="resetCampAlloc()">↺ Reset All</button>
+    </div>
+    <div style="overflow-x:auto;max-height:480px;overflow-y:auto;">
+    <table class="cockpit-table" style="font-size:0.76rem;min-width:700px;">
+      <thead style="position:sticky;top:0;z-index:2;background:var(--card-bg);">
+        <tr>
+          <th style="text-align:left;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Campaign</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Tier</th>
+          <th style="padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Market</th>
+          ${th('YTD Spend','spend')}
+          ${th('ROAS','roas')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">New Budget</th>
+          ${th('Δ Budget','delta')}
+          <th style="text-align:right;padding:0.3rem 0.5rem;font-size:0.7rem;color:var(--muted);">Proj. Rev Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(c => {
+          const key      = c.name || c.campaign;
+          const newSpend = window._campAlloc[key] ?? c.cost;
+          const delta    = newSpend - c.cost;
+          const decay    = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+          const projRevDelta = delta > 0
+            ? delta * c.roas * (1 - decay)
+            : delta > -1 ? 0
+            : c.convValue * (newSpend / c.cost) - c.convValue;
+          const changed  = Math.abs(delta) > 0.5;
+          return `<tr style="${changed ? 'background:rgba(201,168,76,0.06);' : ''}">
+            <td style="padding:0.3rem 0.5rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+            <td style="padding:0.3rem 0.4rem;">${tierBadge(c.tier||'OTHER')}</td>
+            <td style="padding:0.3rem 0.4rem;">${mktBadge(c.market||'')}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;">
+              <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                style="width:85px;text-align:right;background:${changed?'rgba(201,168,76,0.1)':'var(--card-bg)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.2rem 0.35rem;font-size:0.76rem;color:var(--text);"
+                onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)"
+                title="${key}">
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${delta>0?'var(--success)':delta<0?'var(--danger)':'var(--muted)'};">
+              ${delta > 0.5 ? '+' : delta < -0.5 ? '' : '—'}${Math.abs(delta) > 0.5 ? fmt.curK(delta) : ''}
+            </td>
+            <td style="text-align:right;padding:0.3rem 0.5rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+              ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card-bg);font-weight:700;border-top:2px solid var(--border);">
+        <tr>
+          <td colspan="3" style="padding:0.35rem 0.5rem;">Total</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:var(--muted);">${fmt.curK(totalCurr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;">${fmt.curK(totalNew)}</td>
+          <td style="text-align:right;padding:0.35rem 0.5rem;color:${totalNew-totalCurr>0?'var(--success)':totalNew-totalCurr<0?'var(--danger)':'var(--muted)'};">
+            ${totalNew - totalCurr > 0.5 ? '+' : totalNew - totalCurr < -0.5 ? '' : '—'}${Math.abs(totalNew-totalCurr)>0.5?fmt.curK(totalNew-totalCurr):''}
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+  `;
+};
+
+// ── Expandable tiers (in "By Tier" view) ─────────────────────────────────────
+
+window.renderTierExpandRows = function(tier, camps, decay) {
+  const tierCamps = camps.filter(c => (c.tier||'OTHER') === tier && c.cost > 0)
+    .sort((a,b) => b.cost - a.cost);
+  if (!tierCamps.length) return '';
+
+  return `<tr id="tier-expand-${tier.replace(/\s+/g,'_')}" style="display:${window._campExpanded[tier]?'table-row':'none'};">
+    <td colspan="6" style="padding:0;border-bottom:2px solid var(--border);">
+      <div style="background:rgba(0,0,0,0.25);padding:0.4rem 0.75rem 0.5rem;">
+        <div style="font-size:0.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+          ${tier} — ${tierCamps.length} campaigns
+          <button class="btn-ghost" style="font-size:0.68rem;padding:0.1rem 0.4rem;margin-left:0.5rem;" onclick="resetTierCampAlloc('${tier}')">↺ Reset tier</button>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.74rem;">
+          <thead>
+            <tr style="color:var(--muted);font-size:0.68rem;border-bottom:1px solid var(--border);">
+              <th style="text-align:left;padding:0.2rem 0.4rem;">Campaign</th>
+              <th style="text-align:center;padding:0.2rem 0.4rem;">Market</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">YTD Spend</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">ROAS</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">New Budget</th>
+              <th style="text-align:right;padding:0.2rem 0.4rem;">Δ Rev</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tierCamps.map(c => {
+              const key = c.name || c.campaign;
+              const newSpend = window._campAlloc[key] ?? c.cost;
+              const delta = newSpend - c.cost;
+              const projRevDelta = delta > 0
+                ? delta * c.roas * (1 - decay)
+                : delta < -0.5 ? c.convValue * (newSpend/c.cost) - c.convValue : 0;
+              const changed = Math.abs(delta) > 0.5;
+              return `<tr style="${changed?'background:rgba(201,168,76,0.08)':''}">
+                <td style="padding:0.2rem 0.4rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${key}">${key}</td>
+                <td style="text-align:center;padding:0.2rem 0.4rem;">${mktBadge(c.market||'')}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:var(--muted);">${fmt.curK(c.cost)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${roasColor(c.roas)};font-weight:600;">${fmt.roas(c.roas)}</td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;">
+                  <input type="number" value="${Math.round(newSpend)}" min="0" step="500"
+                    style="width:80px;text-align:right;background:${changed?'rgba(201,168,76,0.12)':'rgba(0,0,0,0.2)'};border:1px solid ${changed?'var(--gold)':'var(--border)'};border-radius:4px;padding:0.15rem 0.3rem;font-size:0.73rem;color:var(--text);"
+                    onchange="updateCampAlloc('${key.replace(/'/g,"\\'")}',this.value)">
+                </td>
+                <td style="text-align:right;padding:0.2rem 0.4rem;color:${projRevDelta>0?'var(--success)':projRevDelta<0?'var(--danger)':'var(--muted)'};">
+                  ${Math.abs(projRevDelta) > 0.5 ? (projRevDelta>0?'+':'') + fmt.curK(projRevDelta) : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </td>
+  </tr>`;
+};
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+window.updateCampAlloc = function(key, val) {
+  const v = parseFloat(val) || 0;
+  window._campAlloc[key] = v;
+  // Sync tier totals from campaigns
+  syncTierFromCampaigns();
+  // Re-render the appropriate view
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+  renderScenarioCompare();
+  maybeRefreshProjection();
+};
+
+window.campSort = function(key) {
+  if (window._campSortKey === key) {
+    window._campSortDir *= -1;
+  } else {
+    window._campSortKey = key;
+    window._campSortDir = -1;
+  }
+  renderCampaignBudgetTable();
+};
+
+window.resetCampAlloc = function() {
+  window._campAlloc = {};
+  syncTierFromCampaigns();
+  const mode = window._budgetMode;
+  if (mode === 'campaign') {
+    renderCampaignBudgetTable();
+  } else {
+    renderAllocTable();
+  }
+  recalcBudget();
+};
+
+window.resetTierCampAlloc = function(tier) {
+  const camps = (window.EMINZA.campaigns || []).filter(c => (c.tier||'OTHER') === tier);
+  camps.forEach(c => { delete window._campAlloc[c.name || c.campaign]; });
+  syncTierFromCampaigns();
+  renderAllocTable();
+  recalcBudget();
+};
+
+window.toggleTierExpand = function(tier) {
+  window._campExpanded[tier] = !window._campExpanded[tier];
+  renderAllocTable();
+};
+
+// ── Extended setBudgetView to support 'campaign' mode ─────────────────────────
+
+
+// ── Summary banner for campaign-level changes in outcome panel ─────────────────
+
+window.getCampaignChangeSummary = function() {
+  const all = window.EMINZA.campaigns || [];
+  const changed = all.filter(c => {
+    const key = c.name || c.campaign;
+    return window._campAlloc[key] !== undefined && Math.abs(window._campAlloc[key] - c.cost) > 0.5;
+  });
+  if (!changed.length) return '';
+  const decay = parseFloat(document.getElementById('b-decay')?.value || 0.15);
+  const rows = changed.map(c => {
+    const key = c.name || c.campaign;
+    const newSpend = window._campAlloc[key];
+    const delta = newSpend - c.cost;
+    const projRevDelta = delta > 0 ? delta * c.roas * (1 - decay) : c.convValue * (newSpend/c.cost) - c.convValue;
+    return { name: key, tier: c.tier, market: c.market, delta, projRevDelta, roas: c.roas };
+  }).sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const totalDeltaRev = rows.reduce((s,r) => s+r.projRevDelta, 0);
+  return `
+    <div style="margin-top:0.6rem;border-top:1px solid var(--border);padding-top:0.5rem;">
+      <div style="font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.3rem;">
+        Campaign-Level Changes (${rows.length})
+        <span style="color:${totalDeltaRev>0?'var(--success)':'var(--danger)'}"> · ${totalDeltaRev>0?'+':''}${fmt.curK(totalDeltaRev)} proj. rev</span>
+      </div>
+      <div style="max-height:180px;overflow-y:auto;">
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);font-size:0.67rem;">
+            <th style="text-align:left;padding:0.15rem 0.3rem;">Campaign</th>
+            <th style="padding:0.15rem 0.3rem;">Mkt</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Δ Budget</th>
+            <th style="text-align:right;padding:0.15rem 0.3rem;">Proj. Δ Rev</th>
+          </tr></thead>
+          <tbody>
+            ${rows.slice(0,15).map(r => `<tr>
+              <td style="padding:0.15rem 0.3rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+              <td style="padding:0.15rem 0.3rem;">${mktBadge(r.market||'')}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.delta>0?'var(--success)':'var(--danger)'};">${r.delta>0?'+':''}${fmt.curK(r.delta)}</td>
+              <td style="text-align:right;padding:0.15rem 0.3rem;color:${r.projRevDelta>0?'var(--success)':'var(--danger)'};">${r.projRevDelta>0?'+':''}${fmt.curK(r.projRevDelta)}</td>
+            </tr>`).join('')}
+            ${rows.length > 15 ? `<tr><td colspan="4" style="color:var(--muted);font-size:0.7rem;padding:0.15rem 0.3rem;">…and ${rows.length-15} more</td></tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+};
+
+
+// --- category.js ---
+
+// ═════════════════════════════════════════════════════════════
+// SUIVI / CATEGORY DATA ENGINE
+// Loads from /api/suivi → window.EMINZA.suivi
+// Records: { category, market, week, cost, revenue, roas }
+// Source: Suivi hebdo Excel (6 categories × 8 markets × 31 weeks)
+// ═════════════════════════════════════════════════════════════
+
+
+async function loadSuiviData() {
+  // Try local server first, then fall back to static suivi_data.json
+  const tryFetch = async (url) => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  };
+
+  try {
+    let json;
+    try {
+      json = await tryFetch('/api/suivi');
+    } catch(e) {
+      // No local server — load the static JSON file deployed alongside the app
+      json = await tryFetch('./suivi_data.json');
+    }
+    if (json.error) throw new Error(json.error);
+    window.EMINZA.suivi = json.records || [];
+    window.EMINZA.suiviMeta = json.meta || {};
+    window.EMINZA.suiviSource = json.source || 'Suivi hebdo';
+    console.log(`[Eminza] Suivi loaded: ${window.EMINZA.suivi.length} records`);
+  } catch(e) {
+    console.warn('[Eminza] Suivi data not available:', e.message);
+    window.EMINZA.suivi = [];
+  }
+}
+
+
+function suiviAggregate(records, groupBy, weekNum) {
+  const rows = weekNum !== undefined ? records.filter(r => r.week === weekNum) : records;
+  const map = {};
+  rows.forEach(r => {
+    const key = r[groupBy] || 'Other';
+    if (!map[key]) map[key] = { key, cost: 0, revenue: 0 };
+    map[key].cost    += r.cost;
+    map[key].revenue += r.revenue;
+  });
+  return Object.values(map).map(g => ({
+    ...g,
+    roas:     g.cost > 0 ? g.revenue / g.cost : 0,
+    contRoas: contributionRoas(g.cost > 0 ? g.revenue / g.cost : 0),
+  })).sort((a,b) => b.revenue - a.revenue);
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// SECTION: CATEGORY DETAIL
+// ═════════════════════════════════════════════════════════════
+function renderCategory() {
+  const suivi  = window.EMINZA.suivi || [];
+  const source = window.EMINZA.suiviSource || 'Loading…';
+  const meta   = window.EMINZA.suiviMeta || {};
+  const cats   = meta.categories || [...new Set(suivi.map(r => r.category))].sort();
+  const mkts   = meta.markets    || [...new Set(suivi.map(r => r.market))].sort();
+  const weeks  = (meta.weeks || [...new Set(suivi.map(r => r.week))]).slice().sort((a,b) => a-b);
+  const latestW = weeks[weeks.length - 1] || 0;
+
+  if (!suivi.length) {
+    setMain(`
+      <div class="section-header">
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2>Category Detail</h2>
+      </div>
+      <div class="callout callout-warn" style="margin-top:1rem;">
+        ⏳ Category data loading… click another section and come back, or check that
+        <strong>Suivi hebdo 2026 sem 31-1.xlsx</strong> is in the Performance Analysis folder.
+      </div>`);
+    return;
+  }
+
+  setMain(`
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.75rem;">
+      <div>
+        <div class="breadcrumb">Trends / Category Detail</div>
+        <h2 style="font-size:1.15rem;font-weight:700;margin:0;">Category Detail</h2>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+        <span class="badge" style="background:rgba(16,185,129,0.15);color:var(--success);">
+          ✓ ${source}
+        </span>
+        <span style="font-size:0.75rem;color:var(--muted);">W01–W${latestW} 2026 · ${suivi.length} records · ${cats.length} categories · ${mkts.length} markets</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div style="display:flex;gap:0.75rem;margin-bottom:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Market</label>
+        <select id="cat-market" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="ALL_MARKETS">All Markets</option>
+          ${mkts.map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">View</label>
+        <select id="cat-view" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="revenue">Revenue (CA HT)</option>
+          <option value="cost">Spend</option>
+          <option value="roas">ROAS</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label style="font-size:0.72rem;">Range</label>
+        <select id="cat-range" onchange="refreshCategory()" style="padding:0.3rem 0.5rem;font-size:0.82rem;">
+          <option value="13">Last 13 weeks</option>
+          <option value="26">Last 26 weeks</option>
+          <option value="all" selected>Full year</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ROW 1: Category KPI cards -->
+    <div id="cat-kpi-strip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.75rem;"></div>
+
+    <!-- ROW 2: Revenue trend + ROAS trend -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Revenue by Category <span style="color:var(--muted);font-size:0.72rem;">(CA HT from Suivi)</span></div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-rev"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">ROAS by Category</div>
+        <div style="height:210px;position:relative;"><canvas id="chart-cat-roas"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 3: Spend trend + Category share donut -->
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:0.75rem;margin-bottom:0.75rem;">
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Weekly Spend by Category (stacked)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-spend"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="panel-head" style="margin-bottom:0.5rem;">Revenue Share by Category (YTD)</div>
+        <div style="height:190px;position:relative;"><canvas id="chart-cat-share"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ROW 4: Full heatmap -->
+    <div class="card" style="margin-bottom:0.75rem;">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Week Heatmap <span style="color:var(--muted);font-size:0.72rem;">— colour = ROAS (green ≥ profit BE, amber ≥ variable BE, red below)</span></div>
+      <div id="cat-heatmap" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- ROW 5: Market breakdown table -->
+    <div class="card">
+      <div class="panel-head" style="margin-bottom:0.4rem;">Category × Market Summary (YTD W01–W${latestW})</div>
+      <div id="cat-market-table" style="overflow-x:auto;"></div>
+    </div>
+  `);
+
+  setTimeout(refreshCategory, 60);
+}
+
+
+window.refreshCategory = function() {
+  const suivi   = window.EMINZA.suivi || [];
+  const market  = document.getElementById('cat-market')?.value || 'ALL_MARKETS';
+  const metric  = document.getElementById('cat-view')?.value || 'revenue';
+  const rangeV  = document.getElementById('cat-range')?.value || 'all';
+  const meta    = window.EMINZA.suiviMeta || {};
+  const allWeeks = (meta.weeks || [...new Set(suivi.map(r=>r.week))]).slice().sort((a,b)=>a-b);
+  const weeksToShow = rangeV === 'all' ? allWeeks :
+                      allWeeks.slice(-parseInt(rangeV));
+
+  // Filter by market
+  const filtered = market === 'ALL_MARKETS' ? suivi : suivi.filter(r => r.market === market);
+  const filtWeeks = filtered.filter(r => weeksToShow.includes(r.week));
+
+  const cats = (meta.categories || [...new Set(suivi.map(r=>r.category))]).sort();
+  const weekLabels = weeksToShow.map(w => `W${String(w).padStart(2,'0')}`);
+
+  // ── KPI strip ───────────────────────────────────────────────
+  const kpiEl = document.getElementById('cat-kpi-strip');
+  if (kpiEl) {
+    const ytdAgg = suiviAggregate(filtWeeks, 'category');
+    kpiEl.innerHTML = cats.map(cat => {
+      const g = ytdAgg.find(r=>r.key===cat) || {cost:0,revenue:0,roas:0};
+      const col = CAT_COLORS_SUIVI[cat] || '#8B5CF6';
+      return `<div class="card" style="padding:0.5rem;border-top:2px solid ${col};">
+        <div style="font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cat}</div>
+        <div style="font-size:0.9rem;font-weight:700;margin:0.1rem 0;">${fmt.curK(g.revenue)}</div>
+        <div style="font-size:0.72rem;color:${roasColor(g.roas)};">${fmt.roas(g.roas)} ROAS</div>
+        <div style="font-size:0.68rem;color:var(--muted);">Spend ${fmt.curK(g.cost)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Revenue trend (stacked bar) ──────────────────────────────
+  const revDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r => r.week===w && r.category===cat);
+      return rows.reduce((s,r) => s+r.revenue, 0);
+    }),
+    backgroundColor: (CAT_COLORS_SUIVI[cat]||'#8B5CF6') + 'CC',
+    stack: 'rev', borderRadius: 2, borderWidth: 0,
+  }));
+  makeChart('chart-cat-rev', 'bar', weekLabels, revDatasets, {
+    scales: {
+      x: { stacked:true, ticks:{color:'#8A9BB3'}, grid:{color:'rgba(255,255,255,0.03)'} },
+      y: { stacked:true, ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'}, grid:{color:'rgba(255,255,255,0.04)'} }
+    },
+    plugins: { legend:{ labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } }
+  });
+
+  // ── ROAS multi-line ──────────────────────────────────────────
+  const roasDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+      const sp=rows.reduce((s,r)=>s+r.cost,0);
+      const rv=rows.reduce((s,r)=>s+r.revenue,0);
+      return sp>0 ? parseFloat((rv/sp).toFixed(2)) : null;
+    }),
+    borderColor: CAT_COLORS_SUIVI[cat]||'#8B5CF6',
+    backgroundColor:'transparent', borderWidth:2, pointRadius:2, tension:0.3, spanGaps:true,
+  }));
+  roasDatasets.push({
+    label:`Profit BE (${fmt.roas(FM.profitBreakevenRoas)})`,
+    data: weeksToShow.map(()=>FM.profitBreakevenRoas),
+    borderColor:'#10B98144',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0,
+  });
+  makeChart('chart-cat-roas','line',weekLabels,roasDatasets,{
+    scales:{
+      x:{ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#8A9BB3',callback:v=>v+'x'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{labels:{color:'#8A9BB3',font:{size:10},boxWidth:10}}}
+  });
+
+  // ── Spend stacked bar ────────────────────────────────────────
+  const spendDatasets = cats.map(cat => ({
+    label: cat,
+    data: weeksToShow.map(w => {
+      return filtWeeks.filter(r=>r.week===w&&r.category===cat).reduce((s,r)=>s+r.cost,0);
+    }),
+    backgroundColor:(CAT_COLORS_SUIVI[cat]||'#8B5CF6')+'BB',
+    stack:'sp', borderRadius:2, borderWidth:0,
+  }));
+  makeChart('chart-cat-spend','bar',weekLabels,spendDatasets,{
+    scales:{
+      x:{stacked:true,ticks:{color:'#8A9BB3'},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{stacked:true,ticks:{color:'#8A9BB3',callback:v=>'€'+(v/1000).toFixed(0)+'K'},grid:{color:'rgba(255,255,255,0.04)'}}
+    },
+    plugins:{legend:{display:false}}
+  });
+
+  // ── Revenue share donut ──────────────────────────────────────
+  const ytdTotals = suiviAggregate(filtWeeks,'category');
+  makeChart('chart-cat-share','doughnut',
+    ytdTotals.map(g=>g.key),
+    [{data:ytdTotals.map(g=>g.revenue), backgroundColor:ytdTotals.map(g=>CAT_COLORS_SUIVI[g.key]||'#8B5CF6')}],
+    { plugins:{ legend:{ position:'right', labels:{color:'#8A9BB3',font:{size:10},boxWidth:10} } } }
+  );
+
+  // ── Heatmap ──────────────────────────────────────────────────
+  const heatEl = document.getElementById('cat-heatmap');
+  if (heatEl) {
+    const cellBg = roas => {
+      if (roas === 0) return '#1A2A3F';
+      if (roas >= FM.profitBreakevenRoas) return `rgba(16,185,129,${Math.min(0.75,(roas-FM.profitBreakevenRoas)/6+0.2)})`;
+      if (roas >= FM.variableBreakevenRoas) return `rgba(245,158,11,${Math.min(0.7,(roas-FM.variableBreakevenRoas)/3+0.15)})`;
+      return `rgba(239,68,68,${Math.min(0.7,0.15+0.25*(1-roas/FM.variableBreakevenRoas))})`;
+    };
+    heatEl.innerHTML = `
+      <table style="border-collapse:collapse;font-size:0.71rem;min-width:100%;">
+        <thead><tr>
+          <th style="text-align:left;padding:0.25rem 0.5rem;color:var(--muted);white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">Category</th>
+          ${weeksToShow.map(w=>`<th style="text-align:center;padding:0.2rem 0.1rem;color:var(--muted);min-width:30px;">W${String(w).padStart(2,'0')}</th>`).join('')}
+          <th style="text-align:right;padding:0.2rem 0.5rem;color:var(--muted);">YTD</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const ytdRow = filtWeeks.filter(r=>r.category===cat);
+            const ytdSp  = ytdRow.reduce((s,r)=>s+r.cost,0);
+            const ytdRv  = ytdRow.reduce((s,r)=>s+r.revenue,0);
+            const ytdRoas = ytdSp > 0 ? ytdRv/ytdSp : 0;
+            return `<tr>
+              <td style="padding:0.2rem 0.5rem;white-space:nowrap;position:sticky;left:0;background:var(--card-bg);">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:4px;"></span>
+                <span style="font-size:0.72rem;">${cat}</span>
+              </td>
+              ${weeksToShow.map(w=>{
+                const rows = filtWeeks.filter(r=>r.week===w&&r.category===cat);
+                const sp=rows.reduce((s,r)=>s+r.cost,0);
+                const rv=rows.reduce((s,r)=>s+r.revenue,0);
+                const roas=sp>0?rv/sp:0;
+                return `<td style="text-align:center;padding:0.15rem 0.1rem;background:${cellBg(roas)};border-radius:2px;" title="${cat} W${w}: ROAS ${roas.toFixed(1)}x, Rev €${rv.toFixed(0)}, Spend €${sp.toFixed(0)}">
+                  ${sp>0?`<span style="font-size:0.67rem;color:rgba(255,255,255,0.85);">${roas.toFixed(1)}x</span>`:''}
+                </td>`;
+              }).join('')}
+              <td style="text-align:right;padding:0.2rem 0.5rem;font-weight:600;color:${roasColor(ytdRoas)};">${fmt.roas(ytdRoas)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Market breakdown table ───────────────────────────────────
+  const mkts   = (window.EMINZA.suiviMeta?.markets || [...new Set(suivi.map(r=>r.market))]).sort();
+  const tblEl  = document.getElementById('cat-market-table');
+  if (tblEl) {
+    const ytdAll = suiviAggregate(filtWeeks, 'category');
+    tblEl.innerHTML = `
+      <table class="cockpit-table" style="width:100%;">
+        <thead><tr>
+          <th style="text-align:left;">Category</th>
+          ${market==='ALL_MARKETS' ? mkts.map(m=>`<th style="text-align:right;">${mktBadge(m)}</th>`).join('') : `<th style="text-align:right;">Revenue</th><th style="text-align:right;">Spend</th>`}
+          <th style="text-align:right;">Total Rev</th>
+          <th style="text-align:right;">ROAS</th>
+          <th style="text-align:right;">Cont. ROAS</th>
+        </tr></thead>
+        <tbody>
+          ${cats.map(cat => {
+            const total = filtWeeks.filter(r=>r.category===cat);
+            const totSp = total.reduce((s,r)=>s+r.cost,0);
+            const totRv = total.reduce((s,r)=>s+r.revenue,0);
+            const totRoas = totSp>0?totRv/totSp:0;
+            const mktCells = market==='ALL_MARKETS'
+              ? mkts.map(m => {
+                  const mRows = filtWeeks.filter(r=>r.category===cat&&r.market===m);
+                  const rv = mRows.reduce((s,r)=>s+r.revenue,0);
+                  return `<td style="text-align:right;font-size:0.78rem;">${rv>0?fmt.curK(rv):'—'}</td>`;
+                }).join('')
+              : `<td style="text-align:right;">${fmt.curK(totRv)}</td><td style="text-align:right;">${fmt.curK(totSp)}</td>`;
+            return `<tr>
+              <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${CAT_COLORS_SUIVI[cat]||'#8B5CF6'};margin-right:5px;"></span>${cat}</td>
+              ${mktCells}
+              <td style="text-align:right;font-weight:600;">${fmt.curK(totRv)}</td>
+              <td style="text-align:right;color:${roasColor(totRoas)};font-weight:600;">${fmt.roas(totRoas)}</td>
+              <td style="text-align:right;color:${contRoasColor(contributionRoas(totRoas))};font-weight:600;">${fmt.roas(contributionRoas(totRoas))}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+};
+
+
+// --- wow_trends.js ---
+
+// ═════════════════════════════════════════════════════════════
 // WEEKLY DATA ENGINE
 // Synthesises week-by-week data from YTD aggregates until real
 // weekly Google Sheets data is available.
@@ -61608,9 +63055,8 @@ window.renderAudienceIntelligence    = function() { window.renderCampaignIntelli
 
 // --- meta.js ---
 // ════════════════════════════════════════════════════════════════════════════
-// META ADS INTEGRATION — Facebook Marketing API via JS SDK
-// ── OAuth token stored in localStorage (eminza_meta_token)
-// ── Auto-reconnects silently on page load via FB.getLoginStatus
+// META ADS INTEGRATION — Facebook Marketing API, direct Graph API fetch
+// ── Static token, auto-loads on boot, no OAuth popup
 // ════════════════════════════════════════════════════════════════════════════
 (function() {
 
@@ -61628,225 +63074,130 @@ var META_INSIGHT_FIELDS = [
   'cost_per_action_type'
 ].join(',');
 var META_CAMP_FIELDS = 'name,status,effective_status,daily_budget,lifetime_budget,objective';
+var META_MARKETS = ['FR','IT','ES','NL','BE','DK','UK','CH-DE','CH-FR','CH-IT','CH'];
 
 // ── Init state ────────────────────────────────────────────────────────────────
 window.EMINZA.meta = {
-  ready: false,
-  campaigns: [],
-  byAccount: {},
-  totals: { spend:0, purchaseValue:0, roas:0, impressions:0, clicks:0, purchases:0, ctr:0, cpm:0, cpc:0, cpa:0 },
-  lastFetched: null
+  ready: false, campaigns: [], byAccount: {},
+  totals: { spend:0,purchaseValue:0,roas:0,impressions:0,clicks:0,purchases:0,ctr:0,cpm:0,cpc:0,cpa:0 },
+  lastFetched: null, _apiError: null, _rawAccounts: []
 };
 
-// ── Static token (no OAuth needed for personal dashboard) ────────────────────
-// Token from Graph API Explorer — update via metaSetToken() when it expires
+// ── Static token ──────────────────────────────────────────────────────────────
 var META_STATIC_TOKEN = 'EAAOl2fYwmr4BSQi69M2OMTijBjsEKREk63OeI4AuGl1BtrY9CvDhEFUDd4cYFleGPZA5jx50JeMtNIjRZBL9oVp1LdHLtUCUW0fYkC3xZA9HD7XfawWTF2W24UVRnS0bc6se00MtS33lwJ8aSfGUfcpX3nQmq89VRuZAOakYnCxP5evNx2I4vZClK6WYmFtaLrLIhhC5wjPImq92nFAZBN8XxICbZCFjUGexikwVr4JLLnOVyXRzZBOVSsXCYQim0ZAQZBppzaj7NlhZAq0xxjRxJZBKsfYCmG4P9QGjoh1nHgZDZD';
 
-window.metaIsConnected = function() {
-  return !!(getMetaToken());
-};
-
-function getMetaToken() {
-  // Prefer localStorage override (if user pastes a new token), then fall back to static
-  var stored = localStorage.getItem('eminza_meta_token_v2');
-  return stored || META_STATIC_TOKEN;
-}
-
-function saveMetaToken(token) {
-  localStorage.setItem('eminza_meta_token_v2', token);
-}
-
-// Public helper — paste a new token when the old one expires
-window.metaSetToken = function(token) {
-  saveMetaToken(token.trim());
-  window.EMINZA.meta.ready = false;
+window.metaIsConnected = function() { return !!(getMetaToken()); };
+function getMetaToken() { return localStorage.getItem('eminza_meta_token_v2') || META_STATIC_TOKEN; }
+function saveMetaToken(t) { localStorage.setItem('eminza_meta_token_v2', t); }
+window.metaSetToken = function(t) {
+  saveMetaToken(t.trim()); window.EMINZA.meta.ready = false; window.EMINZA.meta._apiError = null;
+  META_ACCOUNTS = ['act_1413689216412510','act_10152191196629221'];
   window.metaBootConnect();
 };
-
 
 // ── Connect / Disconnect ──────────────────────────────────────────────────────
-window.metaConnect = function(onSuccess) {
-  // With static token, connect just means loading the data
-  window.metaBootConnect();
-  if (onSuccess) setTimeout(onSuccess, 3000);
-};
-
+window.metaConnect = function(cb) { window.metaBootConnect(); if (cb) setTimeout(cb, 3000); };
 window.metaDisconnect = function() {
-  localStorage.removeItem('eminza_meta_token');
-  window.EMINZA.meta.ready = false;
+  localStorage.removeItem('eminza_meta_token_v2'); window.EMINZA.meta.ready = false;
   window.updateMetaSidebarBadge && window.updateMetaSidebarBadge();
-  if (window.renderMetaDashboard) window.renderMetaDashboard();
+  window.renderMetaDashboard && window.renderMetaDashboard();
 };
 
-// ── API fetch helper ──────────────────────────────────────────────────────────
+// ── API fetch ─────────────────────────────────────────────────────────────────
 function metaFetch(path, params) {
   var token = getMetaToken();
-  if (!token) return Promise.reject(new Error('No Meta token'));
+  if (!token) return Promise.reject(new Error('No token'));
   var qs = new URLSearchParams(Object.assign({ access_token: token, limit: 500 }, params || {}));
   return fetch('https://graph.facebook.com/' + META_API_VER + '/' + path + '?' + qs)
-    .then(function(res) {
-      if (res.status === 401 || res.status === 400) {
-        localStorage.removeItem('eminza_meta_token');
-        window.EMINZA.meta.ready = false;
-        throw new Error('Meta token expired');
-      }
-      if (!res.ok) throw new Error('Meta API HTTP ' + res.status);
-      return res.json();
+    .then(function(r) {
+      if (r.status === 401 || r.status === 400) { window.EMINZA.meta.ready = false; throw new Error('Token expired or invalid'); }
+      if (!r.ok) throw new Error('Meta API HTTP ' + r.status);
+      return r.json();
     })
-    .then(function(json) {
-      if (json.error) throw new Error('[Meta API] ' + (json.error.message || 'Unknown error'));
-      return json;
-    });
+    .then(function(j) { if (j.error) throw new Error(j.error.message || 'Meta API error'); return j; });
 }
 
-// ── Fetch one account's campaigns + insights ──────────────────────────────────
+// ── Fetch one account ─────────────────────────────────────────────────────────
 function fetchAccountInsights(accountId, datePreset) {
-  var insightStr = 'insights.date_preset(' + datePreset + '){' + META_INSIGHT_FIELDS + '}';
-  return metaFetch(accountId + '/campaigns', {
-    fields: META_CAMP_FIELDS + ',' + insightStr
-  }).then(function(json) {
-    return { accountId: accountId, data: json.data || [] };
-  });
+  var ins = 'insights.date_preset(' + datePreset + '){' + META_INSIGHT_FIELDS + '}';
+  return metaFetch(accountId + '/campaigns', { fields: META_CAMP_FIELDS + ',' + ins })
+    .then(function(j) { return { accountId: accountId, data: j.data || [] }; });
 }
 
-// ── Discover ad accounts from token ──────────────────────────────────────────
+// ── Discover accounts (filters 0-spend / personal accounts) ──────────────────
 function discoverAccounts() {
-  if (META_ACCOUNTS.length && META_ACCOUNTS[0] !== 'act_1413689216412510') {
-    return Promise.resolve(META_ACCOUNTS);
-  }
-  return metaFetch('me/adaccounts', {
-    fields: 'id,name,account_status',
-    limit: 50
-  }).then(function(json) {
-    window.EMINZA.meta._rawAccounts = json.data || [];
-    console.log('[Meta] /me/adaccounts raw:', JSON.stringify(json));
-    var accts = json.data || [];
-    if (!accts.length) {
-      window.EMINZA.meta._apiError = 'No ad accounts returned for this token. Check that ads_read permission was granted in Graph API Explorer.';
-      return [];
-    }
-    // Use all accounts (active or not)
-    META_ACCOUNTS = accts.map(function(a) { return a.id; });
-    accts.forEach(function(a) { META_ACCT_NAMES[a.id] = a.name + (a.account_status !== 1 ? ' (inactive)' : ''); });
-    console.log('[Meta] Discovered accounts:', META_ACCOUNTS, META_ACCT_NAMES);
-    return META_ACCOUNTS;
-  }).catch(function(err) {
-    window.EMINZA.meta._apiError = 'API error on /me/adaccounts: ' + err.message;
-    console.error('[Meta] discoverAccounts failed:', err.message);
-    return [];
-  });
+  if (META_ACCOUNTS.length && META_ACCOUNTS[0] !== 'act_1413689216412510') return Promise.resolve(META_ACCOUNTS);
+  return metaFetch('me/adaccounts', { fields: 'id,name,account_status', limit: 50 })
+    .then(function(j) {
+      window.EMINZA.meta._rawAccounts = j.data || [];
+      var accts = j.data || [];
+      if (!accts.length) { window.EMINZA.meta._apiError = 'No ad accounts found.'; return []; }
+      META_ACCOUNTS = accts.map(function(a) { return a.id; });
+      accts.forEach(function(a) { META_ACCT_NAMES[a.id] = a.name; });
+      console.log('[Meta] Accounts:', META_ACCOUNTS);
+      return META_ACCOUNTS;
+    }).catch(function(e) { window.EMINZA.meta._apiError = 'API error: ' + e.message; return []; });
 }
 
-// ── Load all accounts ─────────────────────────────────────────────────────────
+// ── Load all ──────────────────────────────────────────────────────────────────
 window.metaLoadAll = function(datePreset) {
   datePreset = datePreset || 'last_30d';
-  return discoverAccounts().then(function(accounts) {
-    if (!accounts.length) return [];
-    return Promise.allSettled(
-      accounts.map(function(id) { return fetchAccountInsights(id, datePreset); })
-    );
+  return discoverAccounts().then(function(accts) {
+    if (!accts.length) return [];
+    return Promise.allSettled(accts.map(function(id) { return fetchAccountInsights(id, datePreset); }));
   });
 };
 
 // ── Process & store ───────────────────────────────────────────────────────────
 window.metaProcessAll = function(results) {
-  var campaigns = [];
-  var byAccount = {};
-  var totSpend=0, totRev=0, totImpr=0, totClicks=0, totPurch=0;
-
-  results.forEach(function(result) {
-    if (result.status !== 'fulfilled') {
-      console.warn('[Meta] Account load failed:', result.reason);
-      return;
-    }
-    var accountId   = result.value.accountId;
-    var accountName = META_ACCT_NAMES[accountId] || accountId;
-    byAccount[accountId] = { name:accountName, spend:0, purchaseValue:0, impressions:0, clicks:0, purchases:0, roas:0, campaigns:[] };
-
-    (result.value.data || []).forEach(function(camp) {
+  if (!results || !results.length) {
+    window.EMINZA.meta.ready = true; window.EMINZA.meta.lastFetched = new Date();
+    window.dispatchEvent(new CustomEvent('metaready')); return;
+  }
+  var campaigns = [], byAccount = {}, tS=0,tR=0,tI=0,tC=0,tP=0;
+  results.forEach(function(res) {
+    if (res.status !== 'fulfilled') { console.warn('[Meta]', res.reason); return; }
+    var aid = res.value.accountId, aName = META_ACCT_NAMES[aid] || aid;
+    byAccount[aid] = { name:aName, spend:0, purchaseValue:0, impressions:0, clicks:0, purchases:0, roas:0, campaigns:[] };
+    (res.value.data || []).forEach(function(camp) {
       var ins = (camp.insights && camp.insights.data && camp.insights.data[0]) || {};
-
-      var spend      = parseFloat(ins.spend || 0);
-      var impressions= parseInt(ins.impressions || 0);
-      var clicks     = parseInt(ins.clicks || 0);
-      var reach      = parseInt(ins.reach || 0);
-      var frequency  = parseFloat(ins.frequency || 0);
-      var ctr        = parseFloat(ins.ctr || 0) / 100;
-      var cpm        = parseFloat(ins.cpm || 0);
-      var cpc        = parseFloat(ins.cpc || 0);
-
-      var purchases = 0, purchaseValue = 0, roas = 0;
-      (ins.actions || []).forEach(function(a) {
-        if (a.action_type === 'purchase' || a.action_type === 'offsite_conversion.fb_pixel_purchase') {
-          purchases = parseFloat(a.value || 0);
-        }
-      });
-      (ins.action_values || []).forEach(function(a) {
-        if (a.action_type === 'purchase' || a.action_type === 'offsite_conversion.fb_pixel_purchase') {
-          purchaseValue = parseFloat(a.value || 0);
-        }
-      });
-      if (ins.purchase_roas && ins.purchase_roas.length) {
-        roas = parseFloat(ins.purchase_roas[0].value || 0);
-      } else if (spend > 0 && purchaseValue > 0) {
-        roas = purchaseValue / spend;
-      }
-
-      var cpa = purchases > 0 ? spend / purchases : 0;
-      var budget = camp.daily_budget ? parseFloat(camp.daily_budget)/100 : parseFloat(camp.lifetime_budget||0)/100;
-
-      var obj = {
-        name: camp.name, accountId: accountId, accountName: accountName,
-        status: camp.effective_status || camp.status || 'UNKNOWN',
-        budget: budget, objective: camp.objective || '',
-        spend: spend, impressions: impressions, clicks: clicks,
-        reach: reach, frequency: frequency,
-        ctr: ctr, cpm: cpm, cpc: cpc,
-        purchases: purchases, purchaseValue: purchaseValue,
-        roas: roas, cpa: cpa
-      };
-
-      campaigns.push(obj);
-      byAccount[accountId].campaigns.push(obj);
-      byAccount[accountId].spend        += spend;
-      byAccount[accountId].purchaseValue += purchaseValue;
-      byAccount[accountId].impressions  += impressions;
-      byAccount[accountId].clicks       += clicks;
-      byAccount[accountId].purchases    += purchases;
-      totSpend += spend; totRev += purchaseValue;
-      totImpr  += impressions; totClicks += clicks; totPurch += purchases;
+      var spend = parseFloat(ins.spend||0), impr = parseInt(ins.impressions||0), clicks = parseInt(ins.clicks||0);
+      var reach = parseInt(ins.reach||0), freq = parseFloat(ins.frequency||0);
+      var ctr = parseFloat(ins.ctr||0)/100, cpm = parseFloat(ins.cpm||0), cpc = parseFloat(ins.cpc||0);
+      var purch = 0, rev = 0;
+      (ins.actions||[]).forEach(function(a) { if (a.action_type==='purchase'||a.action_type==='omni_purchase') purch += parseFloat(a.value||0); });
+      (ins.action_values||[]).forEach(function(a) { if (a.action_type==='purchase'||a.action_type==='omni_purchase') rev += parseFloat(a.value||0); });
+      var roas = spend>0?rev/spend:0, cpa = purch>0?spend/purch:0;
+      tS+=spend; tR+=rev; tI+=impr; tC+=clicks; tP+=purch;
+      byAccount[aid].spend+=spend; byAccount[aid].purchaseValue+=rev; byAccount[aid].impressions+=impr; byAccount[aid].clicks+=clicks; byAccount[aid].purchases+=purch;
+      var obj = { id:camp.id, name:camp.name, status:camp.effective_status||camp.status,
+        objective:(camp.objective||'').replace(/_/g,' '),
+        dailyBudget:parseFloat(camp.daily_budget||0)/100, lifetimeBudget:parseFloat(camp.lifetime_budget||0)/100,
+        accountId:aid, accountName:aName, spend:spend, impressions:impr, clicks:clicks, reach:reach, frequency:freq,
+        ctr:ctr, cpm:cpm, cpc:cpc, purchases:purch, purchaseValue:rev, roas:roas, cpa:cpa, _channel:'meta' };
+      campaigns.push(obj); byAccount[aid].campaigns.push(obj);
     });
-
-    byAccount[accountId].roas = byAccount[accountId].spend > 0
-      ? byAccount[accountId].purchaseValue / byAccount[accountId].spend : 0;
+    byAccount[aid].roas = byAccount[aid].spend>0 ? byAccount[aid].purchaseValue/byAccount[aid].spend : 0;
   });
-
-  campaigns.sort(function(a,b){ return b.spend - a.spend; });
-
-  window.EMINZA.meta.campaigns  = campaigns;
-  window.EMINZA.meta.byAccount  = byAccount;
+  // Filter out 0-spend accounts (removes personal accounts like Wim Ponnet)
+  var fBA = {};
+  Object.keys(byAccount).forEach(function(k) { if (byAccount[k].spend > 0) fBA[k] = byAccount[k]; });
+  window.EMINZA.meta.campaigns = campaigns;
+  window.EMINZA.meta.byAccount = fBA;
   window.EMINZA.meta.totals = {
-    spend: totSpend, purchaseValue: totRev,
-    roas: totSpend > 0 ? totRev / totSpend : 0,
-    impressions: totImpr, clicks: totClicks, purchases: totPurch,
-    ctr:  totImpr  > 0 ? totClicks / totImpr : 0,
-    cpm:  totImpr  > 0 ? (totSpend / totImpr) * 1000 : 0,
-    cpc:  totClicks > 0 ? totSpend / totClicks : 0,
-    cpa:  totPurch  > 0 ? totSpend / totPurch  : 0
+    spend:tS, purchaseValue:tR, roas:tS>0?tR/tS:0, impressions:tI, clicks:tC, purchases:tP,
+    ctr:tI>0?tC/tI:0, cpm:tI>0?(tS/tI)*1000:0, cpc:tC>0?tS/tC:0, cpa:tP>0?tS/tP:0
   };
-  window.EMINZA.meta.ready = true;
-  window.EMINZA.meta.lastFetched = new Date();
+  window.EMINZA.meta.ready = true; window.EMINZA.meta.lastFetched = new Date();
   window.dispatchEvent(new CustomEvent('metaready'));
-  console.log('[Meta] Ready. Campaigns:', campaigns.length, '| Spend:', totSpend.toFixed(2));
+  console.log('[Meta] Ready. Campaigns:', campaigns.length, '| Spend:', tS.toFixed(2), '| Accounts shown:', Object.keys(fBA).length);
 };
 
-// ── Auto-boot on page load ────────────────────────────────────────────────────
+// ── Auto-boot ─────────────────────────────────────────────────────────────────
 window.metaBootConnect = function() {
   if (window.EMINZA.meta.ready) return;
-  // Static token always present — just load data directly, no OAuth needed
   window.metaLoadAll().then(window.metaProcessAll).catch(function(e) {
-    console.error('[Meta] Boot load failed:', e.message);
-    window.EMINZA.meta.ready = false;
+    window.EMINZA.meta._apiError = e.message; console.error('[Meta] Boot failed:', e.message);
   });
 };
 
@@ -61855,206 +63206,518 @@ window.updateMetaSidebarBadge = function() {
   var el = document.getElementById('meta-sidebar-badge');
   if (!el) return;
   el.onclick = function() { navigate('meta'); };
-  if (window.EMINZA.meta.ready) {
+  if (window.EMINZA.meta.ready && window.EMINZA.meta.campaigns.length) {
     el.innerHTML = '📘 Meta Ads <span style="color:var(--success);font-size:0.7rem;font-weight:700">● Live</span>';
+  } else if (window.EMINZA.meta.ready) {
+    el.innerHTML = '📘 Meta Ads <span style="color:var(--danger);font-size:0.7rem">⚠ no data</span>';
   } else {
     el.innerHTML = '📘 Meta Ads <span style="color:var(--muted);font-size:0.7rem">◌ loading…</span>';
   }
 };
+window.addEventListener('metaready', function() {
+  window.updateMetaSidebarBadge && window.updateMetaSidebarBadge();
+  try { if (typeof currentNav !== 'undefined' && currentNav === 'meta') renderSection(); } catch(e){}
+});
 
-// ── Render Meta Ads Dashboard ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+function mktFromName(name) {
+  var m = (name||'').match(/^([A-Z]{2,5}(?:-[A-Z]{2})?)\//);
+  if (m) return m[1];
+  var mkts=['CH-DE','CH-FR','CH-IT','FR','IT','ES','NL','BE','DK','UK','CH'];
+  for (var i=0;i<mkts.length;i++) { if ((name||'').toUpperCase().indexOf(mkts[i])>=0) return mkts[i]; }
+  return 'OTHER';
+}
+function gMktFromName(name) {
+  var mkts=['CH-DE','CH-FR','CH-IT','CH','FR','IT','ES','NL','BE','DK','UK'];
+  for (var i=0;i<mkts.length;i++) { if ((name||'').toUpperCase().indexOf(mkts[i])>=0) return mkts[i]; }
+  return 'OTHER';
+}
+function scalingVerdict(roas, freq, spend) {
+  var vb=(window.FM||{}).variableBreakevenRoas||1.69, pb=(window.FM||{}).profitBreakevenRoas||2.79;
+  if (spend<50)           return {label:'Too small',        color:'var(--muted)',  icon:'—' };
+  if (roas>=pb*1.5&&freq<2) return {label:'Strong Scale',  color:'#10B981',       icon:'🚀'};
+  if (roas>=pb&&freq<2.5)   return {label:'Scale',          color:'#10B981',       icon:'📈'};
+  if (roas>=vb&&freq<3.5)   return {label:'Hold',           color:'#F59E0B',       icon:'⏸'};
+  if (roas>=vb&&freq>=3.5)  return {label:'Refresh Creative',color:'#F59E0B',      icon:'🎨'};
+  if (roas<vb&&freq<3)      return {label:'Optimise',       color:'#EF4444',       icon:'🔧'};
+  return                           {label:'Pause',          color:'#EF4444',       icon:'⛔'};
+}
+var fC=function(v){return '\u20ac'+Math.round(Math.abs(v||0)).toLocaleString('en-GB');};
+var fN=function(v){return Math.round(v||0).toLocaleString('en-GB');};
+var fP=function(v){return ((v||0)*100).toFixed(2)+'%';};
+var fR=function(v){return (v||0).toFixed(2)+'x';};
+var fK=function(v){v=Math.abs(v||0);return v>=1000000?'\u20ac'+(v/1000000).toFixed(1)+'M':v>=1000?'\u20ac'+(v/1000).toFixed(0)+'k':'\u20ac'+Math.round(v);};
+function rC(r){var vb=(window.FM||{}).variableBreakevenRoas||1.69,pb=(window.FM||{}).profitBreakevenRoas||2.79;return r>=pb?'var(--success)':r>=vb?'var(--warning)':'var(--danger)';}
+function kpi(label,value,sub,color){
+  return '<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.9rem 1.1rem;min-width:120px;flex:1">'+
+    '<div style="font-size:0.62rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">'+label+'</div>'+
+    '<div style="font-size:1.3rem;font-weight:700;color:'+(color||'var(--text)')+'">'+value+'</div>'+
+    '<div style="font-size:0.65rem;color:var(--muted);margin-top:2px">'+(sub||'')+'</div></div>';
+}
+function tabNav(active){
+  var tabs=[{id:'overview',label:'📊 Overview'},{id:'scaling',label:'🚀 Scaling'},{id:'campaigns',label:'🔍 All Campaigns'},{id:'budget',label:'💡 Budget'}];
+  return '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:1.25rem;border-bottom:1px solid var(--border);padding-bottom:0.75rem">'+
+    tabs.map(function(t){var on=t.id===active;return '<button onclick="window._metaTab=\''+t.id+'\';window.renderMetaDashboard()" style="padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:0.8rem;font-weight:'+(on?700:500)+';background:'+(on?'var(--gold)':'var(--surface)')+';color:'+(on?'#000':'var(--muted)')+'">'+t.label+'</button>';}).join('')+
+  '</div>';
+}
+function tokenBox(){
+  return '<div style="margin-top:1.25rem;border-top:1px solid var(--border);padding-top:1rem;max-width:480px;margin-left:auto;margin-right:auto">'+
+    '<div style="font-size:0.72rem;color:var(--muted);margin-bottom:6px">Token expired? Get a new one from <a href="https://developers.facebook.com/tools/explorer" target="_blank" style="color:var(--gold)">Graph API Explorer</a> (add <code>ads_read</code>):</div>'+
+    '<div style="display:flex;gap:8px"><input id="meta-token-input" type="text" placeholder="EAAOl2..." style="flex:1;padding:8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.73rem">'+
+    '<button onclick="var t=document.getElementById(\'meta-token-input\').value;if(t.trim())window.metaSetToken(t.trim())" style="background:var(--gold);color:#000;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-weight:700">Update</button></div></div>';
+}
+
+// Tab / filter state
+window._metaTab        = window._metaTab        || 'overview';
+window._metaAcctFilter = window._metaAcctFilter || 'ALL';
+window._metaChanFilter = window._metaChanFilter || 'ALL';
+window._metaMktFilter  = window._metaMktFilter  || 'ALL';
+window._metaSortCol    = window._metaSortCol    || 'spend';
+window._metaSortDir    = window._metaSortDir    || -1;
+window._metaAddBudget  = window._metaAddBudget  || 10000;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN DISPATCHER
+// ═══════════════════════════════════════════════════════════════════════════════
 window.renderMetaDashboard = function() {
-  var meta   = window.EMINZA.meta;
-  var totals = meta.totals;
-
-  // ── NOT YET LOADED ───────────────────────────────────────────────────────
+  var meta=window.EMINZA.meta, totals=meta.totals;
   if (!meta.ready) {
-    var h = '<div style="padding:60px;text-align:center">';
-    h += '<div style="font-size:3rem;margin-bottom:1rem">📘</div>';
-    h += '<h2 style="margin-bottom:0.5rem">Loading Meta Ads data…</h2>';
-    h += '<p style="color:var(--muted);margin-bottom:0">Fetching campaigns from Eminza UK &amp; Eminza accounts.</p>';
-    h += '</div>';
+    var h='<div style="padding:60px;text-align:center"><div style="font-size:3rem;margin-bottom:1rem">📘</div>'+
+      '<h2 style="margin-bottom:0.5rem">Loading Meta Ads data\u2026</h2>'+
+      '<p style="color:var(--muted)">Fetching campaigns from Eminza UK &amp; Eminza accounts.</p></div>';
     if (window.setMain) window.setMain(h);
-    // Auto-trigger load once
     if (!window._metaLoadingInProgress) {
-      window._metaLoadingInProgress = true;
-      window.metaBootConnect();
-      // Re-render once data lands
-      setTimeout(function(){
-        window._metaLoadingInProgress = false;
-        if (window.EMINZA.meta.ready) window.renderMetaDashboard();
-      }, 8000);
+      window._metaLoadingInProgress=true; window.metaBootConnect();
+      setTimeout(function(){window._metaLoadingInProgress=false;if(window.EMINZA.meta.ready)window.renderMetaDashboard();},8000);
     }
     return;
   }
-
-  // ── API ERROR / NO ACCOUNTS ───────────────────────────────────────────────
-  var apiError = window.EMINZA.meta._apiError;
-  var noCampaigns = !meta.campaigns || !meta.campaigns.length;
-  if (noCampaigns) {
-    var h2 = '<div style="padding:40px;text-align:center">';
-    h2 += '<div style="font-size:2rem;margin-bottom:1rem">⚠️</div>';
-    h2 += '<h2 style="margin-bottom:0.5rem">Meta Ads: No data returned</h2>';
-    if (apiError) {
-      h2 += '<p style="color:var(--danger);background:rgba(239,68,68,0.1);border-radius:8px;padding:12px;max-width:560px;margin:0 auto 1rem;font-size:0.85rem">' + apiError + '</p>';
-    }
-    h2 += '<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;max-width:560px;margin:0 auto;text-align:left;font-size:0.82rem;color:var(--muted)">';
-    h2 += '<div style="font-weight:700;color:var(--text);margin-bottom:0.5rem">To fix — generate a new token with ads_read:</div>';
-    h2 += '<ol style="margin:0;padding-left:1.2rem;line-height:2">';
-    h2 += '<li>Go to <a href="https://developers.facebook.com/tools/explorer" target="_blank" style="color:var(--gold)">Graph API Explorer</a></li>';
-    h2 += '<li>Select app: <strong>Eminza Lab</strong></li>';
-    h2 += '<li>Click <strong>Add a Permission</strong> → search <code>ads_read</code> → add it</li>';
-    h2 += '<li>Click <strong>Generate Access Token</strong> → approve</li>';
-    h2 += '<li>Copy the token and paste below:</li>';
-    h2 += '</ol>';
-    h2 += '<div style="display:flex;gap:8px;margin-top:0.75rem">';
-    h2 += '<input id="meta-token-input" type="text" placeholder="EAAOl2..." style="flex:1;padding:8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.75rem">';
-    h2 += '<button onclick="var t=document.getElementById(\'meta-token-input\').value;if(t.trim()){window.metaSetToken(t.trim());}" style="background:var(--gold);color:#000;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-weight:700">Update</button>';
-    h2 += '</div></div>';
-    h2 += '</div>';
-    if (window.setMain) window.setMain(h2);
-    return;
+  if (!meta.campaigns||!meta.campaigns.length) {
+    var err=meta._apiError||'No campaigns returned. Ensure token has ads_read permission.';
+    var h2='<div style="padding:40px;text-align:center"><div style="font-size:2rem;margin-bottom:0.75rem">&#x26A0;&#xFE0F;</div>'+
+      '<h2 style="margin-bottom:0.5rem">Meta Ads: No data</h2>'+
+      '<p style="color:var(--danger);background:rgba(239,68,68,0.1);border-radius:8px;padding:12px;max-width:520px;margin:0 auto 0.5rem;font-size:0.82rem">'+err+'</p>'+
+      tokenBox()+'</div>';
+    if (window.setMain) window.setMain(h2); return;
   }
+  var tab=window._metaTab||'overview';
+  if (tab==='scaling')   {_renderScaling(meta,totals);  return;}
+  if (tab==='campaigns') {_renderAllCampaigns(meta);     return;}
+  if (tab==='budget')    {_renderBudget(meta,totals);    return;}
+  _renderOverview(meta,totals);
+};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 1 — OVERVIEW
+// ═══════════════════════════════════════════════════════════════════════════════
+function _renderOverview(meta,totals){
+  var gC=(window.EMINZA&&window.EMINZA.campaigns)||[];
+  var gS=0,gRv=0; gC.forEach(function(c){gS+=parseFloat(c.Cost||c.cost||0);gRv+=parseFloat(c.ConversionsValue||c.conversionsValue||0);});
+  var gRoas=gS>0?gRv/gS:0, combS=gS+totals.spend, combR=gRv+totals.purchaseValue, combRoas=combS>0?combR/combS:0;
+  var vb=(window.FM||{}).variableBreakevenRoas||1.69;
+  var filt=window._metaAcctFilter||'ALL';
+  var camps=filt==='ALL'?meta.campaigns:meta.campaigns.filter(function(c){return c.accountId===filt;});
+  var fa=filt!=='ALL'&&meta.byAccount[filt]?meta.byAccount[filt]:totals;
+  var fS=fa.spend||0, fRv=fa.purchaseValue||0, fRoas=fS>0?fRv/fS:0, fI=fa.impressions||0, fCl=fa.clicks||0, fP=fa.purchases||0;
 
-  var fC = function(v){ return '€' + Math.round(Math.abs(v||0)).toLocaleString('en-GB'); };
-  var fN = function(v){ return Math.round(v||0).toLocaleString('en-GB'); };
-  var fP = function(v){ return ((v||0)*100).toFixed(2) + '%'; };
-  var fR = function(v){ return (v||0).toFixed(2) + 'x'; };
-  var rC = function(r){
-    var vb=(FM||{}).variableBreakevenRoas||1.69, pb=(FM||{}).profitBreakevenRoas||2.79;
-    return r>=pb?'var(--success)':r>=vb?'var(--warning)':'var(--danger)';
-  };
-
-  var googleCamps = window.EMINZA.campaigns || [];
-  var gSpend = googleCamps.reduce(function(s,c){return s+(c.cost||0);},0);
-  var gRev   = googleCamps.reduce(function(s,c){return s+(c.convValue||0);},0);
-  var gRoas  = gSpend > 0 ? gRev / gSpend : 0;
-  var combSpend = gSpend + totals.spend;
-  var combRev   = gRev   + totals.purchaseValue;
-  var combRoas  = combSpend > 0 ? combRev / combSpend : 0;
-
-  var h = '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1.5rem">';
-  h += '<div><h2 style="margin:0">📘 Meta Ads Dashboard</h2>';
-  h += '<div style="font-size:0.75rem;color:var(--muted);margin-top:0.25rem">Last fetched ' + (meta.lastFetched ? meta.lastFetched.toLocaleTimeString() : '—') + ' · Last 30 days</div></div>';
-  h += '<div style="display:flex;gap:0.5rem;align-items:center">';
-  Object.values(meta.byAccount).forEach(function(a){
-    h += '<span style="background:var(--gold)22;color:var(--gold);border:1px solid var(--gold)44;padding:0.2rem 0.65rem;border-radius:12px;font-size:0.72rem;font-weight:600">● ' + a.name + '</span>';
+  var h='<div style="padding:1rem 1.25rem">';
+  // Header + account filters
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:8px">';
+  h+='<div><h2 style="margin:0;font-size:1.2rem">📘 Meta Ads Dashboard</h2>';
+  h+='<div style="font-size:0.65rem;color:var(--muted);margin-top:2px">Last fetched '+(meta.lastFetched?meta.lastFetched.toLocaleTimeString():'')+' \u00b7 Last 30 days</div></div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
+  h+='<button onclick="window._metaAcctFilter=\'ALL\';window.renderMetaDashboard()" style="padding:4px 10px;border-radius:12px;border:none;cursor:pointer;font-size:0.72rem;font-weight:600;background:'+(filt==='ALL'?'var(--gold)':'var(--surface)')+';color:'+(filt==='ALL'?'#000':'var(--muted)')+'">All</button>';
+  Object.keys(meta.byAccount).forEach(function(id){
+    var nm=meta.byAccount[id].name,active=filt===id;
+    h+='<button onclick="window._metaAcctFilter=\''+id+'\';window.renderMetaDashboard()" style="padding:4px 10px;border-radius:12px;border:none;cursor:pointer;font-size:0.72rem;font-weight:600;background:'+(active?'var(--gold)':'var(--surface)')+';color:'+(active?'#000':'var(--muted)')+'">'+nm+'</button>';
   });
-  h += '<button onclick="window.metaLoadAll().then(function(r){window.metaProcessAll(r);window.renderMetaDashboard();})" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">↻ Refresh</button>';
-  h += '<button onclick="window.metaDisconnect()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Disconnect</button>';
-  h += '</div></div>';
+  h+='<button onclick="window.EMINZA.meta.ready=false;window._metaLoadingInProgress=false;window.metaBootConnect();setTimeout(window.renderMetaDashboard,5000)" style="padding:4px 10px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;font-size:0.72rem">\u21ba</button>';
+  h+='</div></div>';
+  h+=tabNav('overview');
 
-  // KPI cards
-  h += '<div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.5rem">';
-  var cards = [
-    ['Meta Spend', fC(totals.spend), Object.keys(meta.byAccount).length + ' accounts', 'var(--gold)'],
-    ['Purchase Revenue', fC(totals.purchaseValue), 'via Meta Pixel', rC(totals.roas)],
-    ['Purchase ROAS', fR(totals.roas), 'breakeven ' + ((FM||{}).variableBreakevenRoas||1.69).toFixed(2) + 'x', rC(totals.roas)],
-    ['Impressions', fN(totals.impressions), 'CPM ' + fC(totals.cpm), 'var(--text)'],
-    ['Clicks', fN(totals.clicks), 'CTR ' + fP(totals.ctr) + ' · CPC ' + fC(totals.cpc), 'var(--text)'],
-    ['Purchases', fN(totals.purchases), 'Cost/purchase ' + fC(totals.cpa), rC(totals.roas)]
-  ];
-  cards.forEach(function(c) {
-    h += '<div class="card" style="flex:1;min-width:130px">';
-    h += '<div style="font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.25rem">' + c[0] + '</div>';
-    h += '<div style="font-size:1.25rem;font-weight:800;color:' + c[3] + '">' + c[1] + '</div>';
-    h += '<div style="font-size:0.68rem;color:var(--muted);margin-top:0.2rem">' + c[2] + '</div>';
-    h += '</div>';
-  });
-  h += '</div>';
+  // KPIs
+  h+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:1.25rem">';
+  h+=kpi('Meta Spend',fK(fS),Object.keys(meta.byAccount).length+' accounts');
+  h+=kpi('Purchase Revenue',fK(fRv),'via Meta Pixel');
+  h+=kpi('Purchase ROAS',fR(fRoas),'breakeven '+fR(vb),rC(fRoas));
+  h+=kpi('Impressions',fN(fI),'CPM '+fC(fI>0?(fS/fI)*1000:0));
+  h+=kpi('Clicks',fN(fCl),'CTR '+fP2(fI>0?fCl/fI:0)+' \u00b7 CPC '+fC(fCl>0?fS/fCl:0));
+  h+=kpi('Purchases',fN(fP),'CPA '+fC(fP>0?fS/fP:0));
+  h+='</div>';
 
-  // Cross-channel comparison
-  h += '<div class="card" style="margin-bottom:1.5rem">';
-  h += '<h3 style="margin:0 0 0.75rem;font-size:1rem;font-weight:700">🔄 Cross-Channel Overview <span style="font-size:0.7rem;font-weight:400;color:var(--muted)">(Google Ads spend from your Google Sheet · Meta from API)</span></h3>';
-  h += '<div style="overflow-x:auto"><table class="table" style="width:100%"><thead><tr>';
-  h += '<th>Channel</th><th style="text-align:right">Spend</th><th style="text-align:right">Revenue</th><th style="text-align:right">ROAS</th><th style="text-align:right">Share of spend</th><th style="text-align:right">Revenue share</th>';
-  h += '</tr></thead><tbody>';
-  [
-    ['🔵 Google Ads', gSpend, gRev, gRoas],
-    ['📘 Meta Ads',   totals.spend, totals.purchaseValue, totals.roas]
-  ].forEach(function(row) {
-    h += '<tr>';
-    h += '<td style="font-weight:600">' + row[0] + '</td>';
-    h += '<td style="text-align:right">' + fC(row[1]) + '</td>';
-    h += '<td style="text-align:right">' + fC(row[2]) + '</td>';
-    h += '<td style="text-align:right;font-weight:700;color:' + rC(row[3]) + '">' + fR(row[3]) + '</td>';
-    h += '<td style="text-align:right">' + (combSpend>0?((row[1]/combSpend)*100).toFixed(1):'—') + '%</td>';
-    h += '<td style="text-align:right">' + (combRev>0?((row[2]/combRev)*100).toFixed(1):'—') + '%</td>';
-    h += '</tr>';
+  // Cross-channel
+  h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.25rem">';
+  h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">🔀 Cross-Channel Overview <span style="font-size:0.63rem;color:var(--muted);font-weight:400">(Google from Sheet \u00b7 Meta from API)</span></div>';
+  h+='<table style="width:100%;border-collapse:collapse;font-size:0.77rem"><thead><tr style="color:var(--muted);text-transform:uppercase;font-size:0.6rem">';
+  ['Channel','Spend','Revenue','ROAS','% Spend','% Revenue'].forEach(function(c){h+='<th style="text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)">'+c+'</th>';});
+  h+='</tr></thead><tbody>';
+  [{l:'🔵 Google Ads',s:gS,r:gRv,roas:gRoas},{l:'📘 Meta Ads',s:totals.spend,r:totals.purchaseValue,roas:totals.roas},{l:'⚡ Combined',s:combS,r:combR,roas:combRoas,b:true}].forEach(function(row){
+    var sp=combS>0?(row.s/combS)*100:0,rp=combR>0?(row.r/combR)*100:0;
+    h+='<tr style="border-bottom:1px solid var(--border)'+(row.b?';font-weight:700':'')+'"><td style="padding:8px">'+row.l+'</td><td style="padding:8px">'+fK(row.s)+'</td><td style="padding:8px">'+fK(row.r)+'</td><td style="padding:8px;color:'+rC(row.roas)+'">'+fR(row.roas)+'</td><td style="padding:8px">'+sp.toFixed(1)+'%</td><td style="padding:8px">'+rp.toFixed(1)+'%</td></tr>';
   });
-  h += '<tr style="font-weight:800;border-top:2px solid var(--border)">';
-  h += '<td>📊 Combined</td>';
-  h += '<td style="text-align:right">' + fC(combSpend) + '</td>';
-  h += '<td style="text-align:right">' + fC(combRev) + '</td>';
-  h += '<td style="text-align:right;color:' + rC(combRoas) + '">' + fR(combRoas) + '</td>';
-  h += '<td style="text-align:right">100%</td>';
-  h += '<td style="text-align:right">100%</td>';
-  h += '</tr>';
-  h += '</tbody></table></div>';
-  h += '<div style="font-size:0.7rem;color:var(--muted);margin-top:0.75rem">⚠ Google Ads revenue is Ads-reported (last-click). Meta revenue is Pixel-reported (view-through 1d + click 7d by default). Both likely include some double-counting — use GA4 Attribution as the source of truth.</div>';
-  h += '</div>';
+  h+='</tbody></table>';
+  h+='<div style="font-size:0.6rem;color:var(--muted);margin-top:0.5rem">⚡ Google revenue is Ads-reported (last-click). Meta revenue is Pixel-reported (view-through 1d + click 7d). May include double-counting \u2014 use GA4 as truth.</div>';
+  h+='</div>';
+
+  // Market matrix
+  h+=_marketMatrix(meta,gC);
 
   // Per-account cards
-  if (Object.keys(meta.byAccount).length > 1) {
-    h += '<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem">';
-    Object.values(meta.byAccount).forEach(function(acct) {
-      var acctCtr = acct.impressions > 0 ? acct.clicks / acct.impressions : 0;
-      h += '<div class="card" style="flex:1;min-width:220px">';
-      h += '<div style="font-weight:800;color:var(--gold);margin-bottom:0.6rem;font-size:1rem">' + acct.name + ' <span style="font-size:0.68rem;color:var(--muted);font-weight:400">' + acct.campaigns.length + ' campaigns</span></div>';
-      h += '<div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Spend</span><strong>' + fC(acct.spend) + '</strong></div>';
-      h += '<div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Purchase revenue</span><strong>' + fC(acct.purchaseValue) + '</strong></div>';
-      h += '<div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Purchase ROAS</span><strong style="color:' + rC(acct.roas) + '">' + fR(acct.roas) + '</strong></div>';
-      h += '<div style="display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:0.2rem"><span style="color:var(--muted)">Impressions</span><strong>' + fN(acct.impressions) + '</strong></div>';
-      h += '<div style="display:flex;justify-content:space-between;font-size:0.8rem"><span style="color:var(--muted)">CTR</span><strong>' + fP(acctCtr) + '</strong></div>';
-      h += '</div>';
+  h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-bottom:1.25rem">';
+  Object.keys(meta.byAccount).forEach(function(id){
+    var a=meta.byAccount[id];
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem">';
+    h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.6rem">📘 '+a.name+' <span style="font-size:0.65rem;color:var(--muted);font-weight:400">'+a.campaigns.length+' campaigns</span></div>';
+    [['Spend',fK(a.spend)],['Revenue',fK(a.purchaseValue)],['ROAS',{v:fR(a.roas),c:rC(a.roas)}],['Impressions',fN(a.impressions)],['CTR',fP2(a.impressions>0?a.clicks/a.impressions:0)]].forEach(function(r){
+      var val=typeof r[1]==='object'?'<span style="color:'+r[1].c+';font-weight:700">'+r[1].v+'</span>':r[1];
+      h+='<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:0.76rem"><span style="color:var(--muted)">'+r[0]+'</span><span>'+val+'</span></div>';
     });
-    h += '</div>';
-  }
+    h+='</div>';
+  });
+  h+='</div>';
 
   // Campaign table
-  h += '<h3 style="margin:0 0 0.75rem;font-size:1rem;font-weight:700">All Meta Campaigns <span style="font-size:0.72rem;font-weight:400;color:var(--muted)">sorted by spend</span></h3>';
-  h += '<div style="overflow-x:auto">';
-  h += '<table class="table" style="width:100%;min-width:960px"><thead><tr>';
-  h += '<th style="min-width:180px">Campaign</th>';
-  h += '<th>Account</th><th>Status</th><th>Objective</th>';
-  h += '<th style="text-align:right">Spend</th>';
-  h += '<th style="text-align:right">Impressions</th>';
-  h += '<th style="text-align:right">Reach</th>';
-  h += '<th style="text-align:right">Freq</th>';
-  h += '<th style="text-align:right">CTR</th>';
-  h += '<th style="text-align:right">CPM</th>';
-  h += '<th style="text-align:right">CPC</th>';
-  h += '<th style="text-align:right">Purchases</th>';
-  h += '<th style="text-align:right">Revenue</th>';
-  h += '<th style="text-align:right">ROAS</th>';
-  h += '<th style="text-align:right">CPA</th>';
-  h += '</tr></thead><tbody>';
+  h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">All Meta Campaigns</div>';
+  h+=_campTable(camps.slice().sort(function(a,b){return b.spend-a.spend;}));
+  h+='</div>';
+  if (window.setMain) window.setMain(h);
+}
 
-  meta.campaigns.forEach(function(c) {
-    var statusBg = c.status==='ACTIVE'?'var(--success)':c.status==='PAUSED'?'var(--muted)':'var(--danger)';
-    var noData   = c.spend === 0;
-    h += '<tr style="opacity:' + (noData?'0.5':'1') + '">';
-    h += '<td style="font-size:0.8rem;font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+c.name+'">'+c.name+'</td>';
-    h += '<td style="font-size:0.72rem;color:var(--muted)">'+c.accountName+'</td>';
-    h += '<td><span style="font-size:0.68rem;font-weight:700;color:'+statusBg+'">'+c.status+'</span></td>';
-    h += '<td style="font-size:0.72rem;color:var(--muted)">'+c.objective.replace(/_/g,' ')+'</td>';
-    h += '<td style="text-align:right">'+(noData?'—':fC(c.spend))+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.impressions>0?fN(c.impressions):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.reach>0?fN(c.reach):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.frequency>0?c.frequency.toFixed(1):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.clicks>0?fP(c.ctr):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.impressions>0?fC(c.cpm):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.clicks>0?fC(c.cpc):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.purchases>0?fN(c.purchases):'—')+'</td>';
-    h += '<td style="text-align:right">'+(c.purchaseValue>0?fC(c.purchaseValue):'—')+'</td>';
-    h += '<td style="text-align:right;font-weight:700;color:'+(c.spend>0?rC(c.roas):'var(--muted)')+'">'+(c.spend>0?fR(c.roas):'—')+'</td>';
-    h += '<td style="text-align:right;font-size:0.8rem">'+(c.cpa>0?fC(c.cpa):'—')+'</td>';
-    h += '</tr>';
+function fP2(v){return ((v||0)*100).toFixed(2)+'%';}
+
+function _marketMatrix(meta,gC){
+  var gByMkt={},mByMkt={};
+  gC.forEach(function(c){var mkt=gMktFromName(c.Campaign||c.campaign||''),s=parseFloat(c.Cost||c.cost||0),r=parseFloat(c.ConversionsValue||c.conversionsValue||0);if(!gByMkt[mkt])gByMkt[mkt]={s:0,r:0};gByMkt[mkt].s+=s;gByMkt[mkt].r+=r;});
+  meta.campaigns.forEach(function(c){var mkt=mktFromName(c.name);if(!mByMkt[mkt])mByMkt[mkt]={s:0,r:0};mByMkt[mkt].s+=c.spend;mByMkt[mkt].r+=c.purchaseValue;});
+  var mkts=Array.from(new Set(Object.keys(gByMkt).concat(Object.keys(mByMkt)))).filter(function(m){return m!=='OTHER';}).sort();
+  if(!mkts.length) return '';
+  var h='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.25rem"><div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">🌍 Market × Channel Matrix</div>';
+  h+='<table style="width:100%;border-collapse:collapse;font-size:0.73rem"><thead><tr style="color:var(--muted);font-size:0.6rem;text-transform:uppercase">';
+  ['Market','Google Spend','Google ROAS','Meta Spend','Meta ROAS','Blended ROAS'].forEach(function(c){h+='<th style="text-align:'+(c==='Market'?'left':'right')+';padding:5px 8px;border-bottom:1px solid var(--border)">'+c+'</th>';});
+  h+='</tr></thead><tbody>';
+  mkts.forEach(function(mkt){
+    var g=gByMkt[mkt]||{s:0,r:0},m=mByMkt[mkt]||{s:0,r:0};
+    var gRoas=g.s>0?g.r/g.s:0,mRoas=m.s>0?m.r/m.s:0,bRoas=(g.s+m.s)>0?(g.r+m.r)/(g.s+m.s):0;
+    h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px 8px;font-weight:600">'+mkt+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+(g.s>0?fK(g.s):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(gRoas?rC(gRoas):'var(--muted)')+')">'+(gRoas?fR(gRoas):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+(m.s>0?fK(m.s):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(mRoas?rC(mRoas):'var(--muted)')+')">'+(mRoas?fR(mRoas):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;font-weight:700;color:'+(bRoas?rC(bRoas):'var(--muted)')+')">'+(bRoas?fR(bRoas):'—')+'</td></tr>';
   });
-  h += '</tbody></table></div>';
+  h+='</tbody></table></div>';
+  return h;
+}
 
-  if (window.setMain) setMain(h);
-};
+function _campTable(camps){
+  if(!camps.length) return '<div style="color:var(--muted);padding:1.5rem;text-align:center">No campaigns</div>';
+  var h='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.73rem"><thead><tr style="color:var(--muted);font-size:0.6rem;text-transform:uppercase">';
+  ['Campaign','Account','Status','Obj.','Spend','Impr','Reach','Freq','CTR','CPM','CPC','Purch.','Revenue','ROAS','CPA'].forEach(function(c){
+    h+='<th style="text-align:'+(c==='Campaign'||c==='Account'||c==='Status'||c==='Obj.'?'left':'right')+';padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap">'+c+'</th>';
+  });
+  h+='</tr></thead><tbody>';
+  camps.forEach(function(c){
+    h+='<tr style="border-bottom:1px solid var(--border)">';
+    h+='<td style="padding:6px 8px;max-width:220px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+c.name+'">'+c.name+'</div></td>';
+    h+='<td style="padding:6px 8px;white-space:nowrap;color:var(--muted);font-size:0.68rem">'+c.accountName+'</td>';
+    h+='<td style="padding:6px 8px"><span style="color:'+(c.status==='ACTIVE'?'var(--success)':'var(--muted)')+';font-size:0.68rem;font-weight:600">'+(c.status||'—')+'</span></td>';
+    h+='<td style="padding:6px 8px;font-size:0.68rem;color:var(--muted)">'+(c.objective||'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fK(c.spend)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fN(c.impressions)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fN(c.reach)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(c.frequency>3.5?'var(--danger)':c.frequency>2.5?'var(--warning)':'inherit')+'">'+(c.frequency||0).toFixed(1)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fP2(c.ctr)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fC(c.cpm)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fC(c.cpc)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fN(c.purchases)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fK(c.purchaseValue)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;font-weight:700;color:'+rC(c.roas)+'">'+fR(c.roas)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fC(c.cpa)+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table></div>';
+  return h;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 2 — SCALING INTELLIGENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+function _renderScaling(meta,totals){
+  var gC=(window.EMINZA&&window.EMINZA.campaigns)||[];
+  var gS=0,gRv=0; gC.forEach(function(c){gS+=parseFloat(c.Cost||c.cost||0);gRv+=parseFloat(c.ConversionsValue||c.conversionsValue||0);});
+  var gRoas=gS>0?gRv/gS:0;
+  var groups={'Strong Scale':[],'Scale':[],'Hold':[],'Refresh Creative':[],'Optimise':[],'Pause':[],'Too small':[]};
+  meta.campaigns.filter(function(c){return c.status==='ACTIVE';}).forEach(function(c){
+    var v=scalingVerdict(c.roas,c.frequency,c.spend); if(groups[v.label]) groups[v.label].push(c);
+  });
+
+  var h='<div style="padding:1rem 1.25rem"><h2 style="margin:0 0 1rem;font-size:1.2rem">🚀 Meta Scaling Intelligence</h2>';
+  h+=tabNav('scaling');
+
+  // Channel comparison
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:1.25rem">';
+  h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem"><div style="font-size:0.72rem;color:var(--muted);font-weight:600;margin-bottom:4px">🔵 GOOGLE ADS</div><div style="font-size:1.4rem;font-weight:700;color:'+rC(gRoas)+'">'+fR(gRoas)+'</div><div style="font-size:0.68rem;color:var(--muted)">ROAS \u00b7 '+fK(gS)+' spend</div></div>';
+  h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem"><div style="font-size:0.72rem;color:var(--muted);font-weight:600;margin-bottom:4px">📘 META ADS</div><div style="font-size:1.4rem;font-weight:700;color:'+rC(totals.roas)+'">'+fR(totals.roas)+'</div><div style="font-size:0.68rem;color:var(--muted)">ROAS \u00b7 '+fK(totals.spend)+' spend</div></div>';
+  h+='</div>';
+
+  // Summary badges
+  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:1.25rem">';
+  var colors={'Strong Scale':'#10B981','Scale':'#10B981','Hold':'#F59E0B','Refresh Creative':'#F59E0B','Optimise':'#EF4444','Pause':'#EF4444'};
+  ['Strong Scale','Scale','Hold','Refresh Creative','Optimise','Pause'].forEach(function(lbl){
+    var n=(groups[lbl]||[]).length; if(!n) return;
+    var ts=(groups[lbl]||[]).reduce(function(s,c){return s+c.spend;},0);
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.6rem 0.9rem">';
+    h+='<div style="font-size:1.1rem;font-weight:700;color:'+(colors[lbl]||'var(--text)')+'">'+n+'</div>';
+    h+='<div style="font-size:0.68rem;font-weight:600;color:'+(colors[lbl]||'var(--muted)')+'">'+lbl+'</div>';
+    h+='<div style="font-size:0.63rem;color:var(--muted)">'+fK(ts)+' spend</div></div>';
+  });
+  h+='</div>';
+
+  // Scale candidates
+  var scalable=(groups['Strong Scale']||[]).concat(groups['Scale']||[]).sort(function(a,b){return b.roas-a.roas;});
+  if(scalable.length){
+    h+='<div style="margin-bottom:1.25rem"><div style="font-weight:700;font-size:0.9rem;color:var(--success);margin-bottom:0.75rem">✅ Scale These Campaigns</div>';
+    scalable.forEach(function(c){
+      var v=scalingVerdict(c.roas,c.frequency,c.spend);
+      h+='<div style="background:var(--surface);border:1px solid #10B98133;border-radius:8px;padding:0.75rem 1rem;margin-bottom:8px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+      h+='<div style="font-size:1.3rem">'+v.icon+'</div>';
+      h+='<div style="flex:1;min-width:180px"><div style="font-weight:600;font-size:0.82rem">'+c.name.substring(0,65)+(c.name.length>65?'\u2026':'')+'</div>';
+      h+='<div style="font-size:0.68rem;color:var(--muted)">'+c.accountName+' \u00b7 '+mktFromName(c.name)+' \u00b7 Freq '+c.frequency.toFixed(1)+'</div></div>';
+      h+='<div style="text-align:right"><div style="font-weight:700;font-size:1rem;color:var(--success)">'+fR(c.roas)+'</div><div style="font-size:0.68rem;color:var(--muted)">'+fK(c.spend)+'/mo</div></div>';
+      h+='<div style="background:rgba(16,185,129,0.12);border-radius:6px;padding:6px 10px;font-size:0.72rem;color:var(--success);white-space:nowrap">\u2192 Try '+fK(c.spend*1.5)+'/mo</div>';
+      h+='</div>';
+    });
+    h+='</div>';
+  }
+
+  // Saturation alerts
+  var sat=(groups['Refresh Creative']||[]).sort(function(a,b){return b.frequency-a.frequency;}).slice(0,8);
+  if(sat.length){
+    h+='<div style="margin-bottom:1.25rem"><div style="font-weight:700;font-size:0.9rem;color:var(--warning);margin-bottom:0.75rem">🎨 High Frequency \u2014 Refresh Creative</div>';
+    sat.forEach(function(c){
+      h+='<div style="background:var(--surface);border:1px solid #F59E0B33;border-radius:8px;padding:0.7rem 1rem;margin-bottom:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+      h+='<div style="flex:1;min-width:180px"><div style="font-weight:600;font-size:0.8rem">'+c.name.substring(0,65)+(c.name.length>65?'\u2026':'')+'</div>';
+      h+='<div style="font-size:0.68rem;color:var(--muted)">'+c.accountName+' \u00b7 '+fK(c.spend)+' spend</div></div>';
+      h+='<div style="font-weight:700;color:var(--warning)">Freq: '+c.frequency.toFixed(1)+'</div>';
+      h+='<div style="font-weight:700;color:'+rC(c.roas)+'">'+fR(c.roas)+'</div>';
+      h+='</div>';
+    });
+    h+='</div>';
+  }
+
+  // Market gap analysis
+  h+=_marketGap(meta,gC);
+
+  // Pause candidates
+  var pause=(groups['Pause']||[]).sort(function(a,b){return b.spend-a.spend;}).slice(0,6);
+  if(pause.length){
+    h+='<div style="margin-bottom:1.25rem"><div style="font-weight:700;font-size:0.9rem;color:var(--danger);margin-bottom:0.75rem">⛔ Consider Pausing</div>';
+    pause.forEach(function(c){
+      h+='<div style="background:var(--surface);border:1px solid #EF444433;border-radius:8px;padding:0.7rem 1rem;margin-bottom:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+      h+='<div style="flex:1;min-width:180px"><div style="font-weight:600;font-size:0.8rem">'+c.name.substring(0,65)+(c.name.length>65?'\u2026':'')+'</div>';
+      h+='<div style="font-size:0.68rem;color:var(--muted)">'+c.accountName+' \u00b7 '+fK(c.spend)+' \u00b7 Freq '+c.frequency.toFixed(1)+'</div></div>';
+      h+='<div style="font-weight:700;color:var(--danger)">'+fR(c.roas)+'</div>';
+      h+='</div>';
+    });
+    h+='</div>';
+  }
+  h+='</div>';
+  if(window.setMain) window.setMain(h);
+}
+
+function _marketGap(meta,gC){
+  var gByMkt={},mByMkt={};
+  gC.forEach(function(c){var mkt=gMktFromName(c.Campaign||c.campaign||''),s=parseFloat(c.Cost||c.cost||0),r=parseFloat(c.ConversionsValue||c.conversionsValue||0);if(!gByMkt[mkt])gByMkt[mkt]={s:0,r:0};gByMkt[mkt].s+=s;gByMkt[mkt].r+=r;});
+  meta.campaigns.forEach(function(c){var mkt=mktFromName(c.name);if(!mByMkt[mkt])mByMkt[mkt]={s:0,r:0};mByMkt[mkt].s+=c.spend;mByMkt[mkt].r+=c.purchaseValue;});
+  var mkts=Object.keys(gByMkt).filter(function(m){return m!=='OTHER'&&gByMkt[m].s>0;});
+  if(!mkts.length) return '';
+  var rows=mkts.map(function(m){
+    var g=gByMkt[m],mp=mByMkt[m]||{s:0,r:0};
+    var gR=g.s>0?g.r/g.s:0,mR=mp.s>0?mp.r/mp.s:0;
+    var sig=mp.s<100?'🟡 Untested on Meta':mR>gR?'🟢 Meta stronger':'🔵 Google stronger';
+    return{m:m,gS:g.s,gR:gR,mS:mp.s,mR:mR,sig:sig};
+  }).sort(function(a,b){return b.gS-a.gS;});
+  var h='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.25rem"><div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">🌍 Google vs Meta by Market \u2014 Where to Test Next</div>';
+  h+='<table style="width:100%;border-collapse:collapse;font-size:0.73rem"><thead><tr style="color:var(--muted);font-size:0.6rem;text-transform:uppercase">';
+  ['Market','Google Spend','Google ROAS','Meta Spend','Meta ROAS','Signal'].forEach(function(c){h+='<th style="text-align:'+(c==='Market'?'left':'right')+';padding:5px 8px;border-bottom:1px solid var(--border)">'+c+'</th>';});
+  h+='</tr></thead><tbody>';
+  rows.forEach(function(r){
+    h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px 8px;font-weight:600">'+r.m+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fK(r.gS)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+rC(r.gR)+'">'+fR(r.gR)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+(r.mS>0?fK(r.mS):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(r.mR?rC(r.mR):'var(--muted)')+')">'+(r.mR?fR(r.mR):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;font-size:0.7rem">'+r.sig+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  return h;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 3 — UNIFIED CAMPAIGN EXPLORER
+// ═══════════════════════════════════════════════════════════════════════════════
+function _renderAllCampaigns(meta){
+  var gC=(window.EMINZA&&window.EMINZA.campaigns)||[];
+  var gNorm=gC.map(function(c){
+    var s=parseFloat(c.Cost||c.cost||0),r=parseFloat(c.ConversionsValue||c.conversionsValue||0),p=parseFloat(c.Conversions||c.conversions||0),i=parseInt(c.Impressions||c.impressions||0);
+    var roas=s>0?r/s:0,cpa=p>0?s/p:0;
+    var st=(c['Campaign state']||c.status||'').toLowerCase();
+    return{_channel:'google',name:c.Campaign||c.campaign||'—',
+      status:st==='enabled'||st==='active'?'ACTIVE':(st||'—').toUpperCase(),
+      objective:c.Tier||c.tier||'',accountName:'Google Ads',spend:s,impressions:i,reach:0,frequency:0,
+      ctr:parseFloat(c.CTR||c.ctr||0)/100,cpm:i>0?(s/i)*1000:0,cpc:parseFloat(c.CPC||c.cpc||0),
+      purchases:p,purchaseValue:r,roas:roas,cpa:cpa};
+  }).filter(function(c){return c.spend>0;});
+
+  var all=gNorm.concat(meta.campaigns);
+  var chanF=window._metaChanFilter||'ALL',mktF=window._metaMktFilter||'ALL';
+  var sortC=window._metaSortCol||'spend',sortD=window._metaSortDir||-1;
+  if(chanF!=='ALL') all=all.filter(function(c){return c._channel===chanF;});
+  if(mktF!=='ALL')  all=all.filter(function(c){return(c._channel==='meta'?mktFromName(c.name):gMktFromName(c.name))===mktF;});
+  all.sort(function(a,b){return sortD*((b[sortC]||0)-(a[sortC]||0));});
+
+  var h='<div style="padding:1rem 1.25rem">';
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:8px"><h2 style="margin:0;font-size:1.2rem">🔍 Unified Campaign Explorer</h2><div style="font-size:0.72rem;color:var(--muted)">'+all.length+' campaigns shown</div></div>';
+  h+=tabNav('campaigns');
+
+  // Channel + market filters
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:1rem">';
+  [{id:'ALL',l:'All'},{id:'google',l:'🔵 Google'},{id:'meta',l:'📘 Meta'}].forEach(function(ch){
+    var active=chanF===ch.id;
+    h+='<button onclick="window._metaChanFilter=\''+ch.id+'\';window.renderMetaDashboard()" style="padding:4px 12px;border-radius:12px;border:none;cursor:pointer;font-size:0.72rem;font-weight:600;background:'+(active?'var(--gold)':'var(--surface)')+';color:'+(active?'#000':'var(--muted)')+'">'+ch.l+'</button>';
+  });
+  h+='<span style="align-self:center;color:var(--border);margin:0 2px">|</span>';
+  ['ALL'].concat(META_MARKETS.slice(0,9)).forEach(function(m){
+    var active=mktF===m;
+    h+='<button onclick="window._metaMktFilter=\''+m+'\';window.renderMetaDashboard()" style="padding:4px 10px;border-radius:12px;border:none;cursor:pointer;font-size:0.7rem;font-weight:600;background:'+(active?'var(--gold)':'var(--surface)')+';color:'+(active?'#000':'var(--muted)')+'">'+( m==='ALL'?'All Markets':m)+'</button>';
+  });
+  h+='</div>';
+
+  if(!all.length){h+='<div style="color:var(--muted);text-align:center;padding:2rem">No campaigns match filters</div></div>';if(window.setMain)window.setMain(h);return;}
+
+  var cols=[
+    {k:'_channel',l:'Ch.',align:'left'},{k:'name',l:'Campaign',align:'left'},{k:'status',l:'Status',align:'left'},
+    {k:'spend',l:'Spend',align:'right',sort:true},{k:'impressions',l:'Impr',align:'right',sort:true},
+    {k:'frequency',l:'Freq',align:'right'},{k:'ctr',l:'CTR',align:'right'},
+    {k:'purchases',l:'Purch.',align:'right',sort:true},{k:'purchaseValue',l:'Revenue',align:'right',sort:true},
+    {k:'roas',l:'ROAS',align:'right',sort:true},{k:'cpa',l:'CPA',align:'right'}
+  ];
+  h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.73rem"><thead><tr style="color:var(--muted);font-size:0.6rem;text-transform:uppercase">';
+  cols.forEach(function(col){
+    var isS=col.k===sortC,arrow=isS?(sortD>0?' \u2191':' \u2193'):'',cur=col.sort?'cursor:pointer':'';
+    var oc=col.sort?' onclick="window._metaSortCol=\''+col.k+'\';window._metaSortDir='+(isS?-sortD:-1)+';window.renderMetaDashboard()"':'';
+    h+='<th style="text-align:'+col.align+';padding:5px 8px;border-bottom:1px solid var(--border);'+cur+';white-space:nowrap"'+oc+'>'+col.l+arrow+'</th>';
+  });
+  h+='</tr></thead><tbody>';
+  all.forEach(function(c){
+    var mkt=c._channel==='meta'?mktFromName(c.name):gMktFromName(c.name);
+    var v=c._channel==='meta'&&c.spend>50?scalingVerdict(c.roas,c.frequency,c.spend):null;
+    h+='<tr style="border-bottom:1px solid var(--border)">';
+    h+='<td style="padding:6px 8px">'+(c._channel==='meta'?'📘':'🔵')+'</td>';
+    h+='<td style="padding:6px 8px;max-width:240px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+c.name+'">'+c.name+'</div>';
+    h+='<div style="font-size:0.62rem;color:var(--muted)">'+mkt+(c._channel==='meta'?' \u00b7 '+c.accountName:'')+'</div></td>';
+    h+='<td style="padding:6px 8px"><span style="color:'+(c.status==='ACTIVE'?'var(--success)':'var(--muted)')+';font-size:0.68rem;font-weight:600">'+c.status+'</span>'+(v?'<span style="margin-left:4px;font-size:0.65rem;color:'+v.color+'">'+v.icon+'</span>':'')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fK(c.spend)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fN(c.impressions)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(c.frequency>3.5?'var(--danger)':c.frequency>2.5?'var(--warning)':'inherit')+'">'+(c.frequency?c.frequency.toFixed(1):'—')+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fP2(c.ctr)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fN(c.purchases)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fK(c.purchaseValue)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;font-weight:700;color:'+rC(c.roas)+'">'+fR(c.roas)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fC(c.cpa)+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table></div></div>';
+  if(window.setMain) window.setMain(h);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 4 — BUDGET ALLOCATION ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+function _renderBudget(meta,totals){
+  var gC=(window.EMINZA&&window.EMINZA.campaigns)||[];
+  var gS=0,gRv=0; gC.forEach(function(c){gS+=parseFloat(c.Cost||c.cost||0);gRv+=parseFloat(c.ConversionsValue||c.conversionsValue||0);});
+  var mS=totals.spend,mRv=totals.purchaseValue,totS=gS+mS,totRv=gRv+mRv;
+  var addB=window._metaAddBudget||10000;
+  var gRoas=gS>0?gRv/gS:0,mRoas=mS>0?mRv/mS:0;
+  var gPct=totS>0?(gS/totS)*100:50,mPct=100-gPct;
+
+  var scalable=meta.campaigns
+    .filter(function(c){return c.status==='ACTIVE'&&c.spend>100;})
+    .map(function(c){var v=scalingVerdict(c.roas,c.frequency,c.spend);return Object.assign({},c,{_v:v,_eff:c.roas*(1/Math.max(c.frequency,0.5))});})
+    .filter(function(c){return c._v.label==='Strong Scale'||c._v.label==='Scale'||c._v.label==='Hold';})
+    .sort(function(a,b){return b._eff-a._eff;});
+  var totEff=scalable.reduce(function(s,c){return s+c._eff;},0);
+  scalable.forEach(function(c){c._alloc=totEff>0?(c._eff/totEff)*addB:0;c._projRev=c._alloc*c.roas*Math.pow(0.88,c._alloc/Math.max(c.spend,1));});
+  var projRev=scalable.reduce(function(s,c){return s+c._projRev;},0);
+
+  var h='<div style="padding:1rem 1.25rem"><h2 style="margin:0 0 1rem;font-size:1.2rem">💡 Budget Allocation Engine</h2>';
+  h+=tabNav('budget');
+
+  // KPIs
+  h+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:1.25rem">';
+  h+=kpi('Total Spend',fK(totS),'Google + Meta');
+  h+=kpi('Total Revenue',fK(totRv),'Blended');
+  h+=kpi('Blended ROAS',fR(totS>0?totRv/totS:0),'',rC(totS>0?totRv/totS:0));
+  h+=kpi('Google Share',gPct.toFixed(1)+'%',fK(gS)+' \u00b7 '+fR(gRoas));
+  h+=kpi('Meta Share',mPct.toFixed(1)+'%',fK(mS)+' \u00b7 '+fR(mRoas));
+  h+='</div>';
+
+  // Spend bar
+  h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.25rem">';
+  h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">Current Spend Mix</div>';
+  h+='<div style="display:flex;height:30px;border-radius:6px;overflow:hidden;margin-bottom:0.5rem">';
+  h+='<div style="width:'+gPct.toFixed(1)+'%;background:#3B82F6;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;color:#fff;min-width:60px">Google '+gPct.toFixed(0)+'%</div>';
+  h+='<div style="width:'+mPct.toFixed(1)+'%;background:#1877F2;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;color:#fff;min-width:60px">Meta '+mPct.toFixed(0)+'%</div>';
+  h+='</div>';
+  h+='<div style="display:flex;justify-content:space-between;font-size:0.72rem;color:var(--muted)"><span>🔵 Google: '+fK(gS)+' \u00b7 '+fR(gRoas)+'</span><span>📘 Meta: '+fK(mS)+' \u00b7 '+fR(mRoas)+'</span></div>';
+  h+='</div>';
+
+  // Slider + allocation
+  h+='<div style="background:var(--surface);border:1px solid var(--gold);border-radius:8px;padding:1rem;margin-bottom:1.25rem">';
+  h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.75rem">💡 Add budget to Meta \u2014 where does it go?</div>';
+  h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:0.75rem;flex-wrap:wrap">';
+  h+='<span style="font-size:0.8rem;color:var(--muted)">Additional budget:</span>';
+  h+='<input type="range" min="1000" max="50000" step="1000" value="'+addB+'" oninput="window._metaAddBudget=parseInt(this.value);document.getElementById(\'mba-v\').textContent=\'\u20ac\'+parseInt(this.value).toLocaleString(\'en-GB\');window.renderMetaDashboard()" style="flex:1;min-width:150px">';
+  h+='<span id="mba-v" style="font-weight:700;font-size:1rem;min-width:70px">'+fK(addB)+'</span></div>';
+  if(scalable.length>0){
+    h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:0.75rem">';
+    [['+'+fK(projRev),'Projected Revenue','var(--success)'],[fR(addB>0?projRev/addB:0),'Projected ROAS','var(--warning)'],[''+scalable.length,'Campaigns funded','#3B82F6']].forEach(function(r){
+      h+='<div style="background:rgba(0,0,0,0.15);border-radius:6px;padding:0.6rem;text-align:center"><div style="font-size:1.1rem;font-weight:700;color:'+r[2]+'">'+r[0]+'</div><div style="font-size:0.65rem;color:var(--muted)">'+r[1]+'</div></div>';
+    });
+    h+='</div>';
+    h+='<div style="font-weight:600;font-size:0.78rem;margin-bottom:0.5rem">Recommended Allocation:</div>';
+    h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.73rem"><thead><tr style="color:var(--muted);font-size:0.6rem;text-transform:uppercase">';
+    ['Campaign','Current/mo','Add','New Total','ROAS','Proj. Rev.'].forEach(function(c){h+='<th style="text-align:'+(c==='Campaign'?'left':'right')+';padding:5px 8px;border-bottom:1px solid var(--border)">'+c+'</th>';});
+    h+='</tr></thead><tbody>';
+    scalable.slice(0,12).forEach(function(c){
+      h+='<tr style="border-bottom:1px solid var(--border)">';
+      h+='<td style="padding:6px 8px;max-width:220px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+c.name+'">'+c.name.substring(0,50)+(c.name.length>50?'\u2026':'')+'</div>';
+      h+='<div style="font-size:0.62rem;color:var(--muted)">'+c.accountName+' \u00b7 '+c._v.label+'</div></td>';
+      h+='<td style="padding:6px 8px;text-align:right">'+fK(c.spend)+'</td>';
+      h+='<td style="padding:6px 8px;text-align:right;color:var(--success);font-weight:600">+'+fK(c._alloc)+'</td>';
+      h+='<td style="padding:6px 8px;text-align:right;font-weight:600">'+fK(c.spend+c._alloc)+'</td>';
+      h+='<td style="padding:6px 8px;text-align:right;color:'+rC(c.roas)+'">'+fR(c.roas)+'</td>';
+      h+='<td style="padding:6px 8px;text-align:right;color:var(--success)">+'+fK(c._projRev)+'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+  } else {
+    h+='<div style="color:var(--muted);text-align:center;padding:1rem;font-size:0.82rem">No scalable active campaigns found. Check Scaling Intelligence tab.</div>';
+  }
+  h+='</div>';
+
+  // Strategic recommendation
+  var rec='';
+  if(mRoas>gRoas*1.2) rec='📘 Meta is outperforming Google ('+fR(mRoas)+' vs '+fR(gRoas)+'). Consider shifting 10-15% of Google budget to Meta, starting with your top-performing markets.';
+  else if(gRoas>mRoas*1.2) rec='🔵 Google is outperforming Meta ('+fR(gRoas)+' vs '+fR(mRoas)+'). Scale Meta with retargeting-first strategy. Test new markets where Google already works well.';
+  else rec='⚡ Both channels perform comparably (Google '+fR(gRoas)+' vs Meta '+fR(mRoas)+'). Diversify new budget across both. Prioritise markets with untested Meta presence.';
+  h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem">';
+  h+='<div style="font-weight:700;font-size:0.85rem;margin-bottom:0.5rem">📋 Strategic Recommendation</div>';
+  h+='<p style="margin:0;font-size:0.82rem;color:var(--muted);line-height:1.65">'+rec+'</p></div>';
+  h+='</div>';
+  if(window.setMain) window.setMain(h);
+}
 
 })();
